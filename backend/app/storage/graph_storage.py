@@ -46,6 +46,8 @@ class GraphStorage(ABC):
         chunks: List[str],
         batch_size: int = 3,
         progress_callback: Optional[Callable] = None,
+        cache_context: Optional[Dict[str, Any]] = None,
+        profile_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> List[str]:
         """Batch-add text chunks. Returns list of episode_ids."""
 

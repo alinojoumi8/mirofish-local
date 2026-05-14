@@ -270,7 +270,7 @@ class SimulationIPCClient:
         """
         Check if simulation environment is alive
         
-        Judge by checking env_status.json file
+        Judge by checking env_status.json and the recorded simulation process.
         """
         status_file = os.path.join(self.simulation_dir, "env_status.json")
         if not os.path.exists(status_file):
@@ -279,7 +279,24 @@ class SimulationIPCClient:
         try:
             with open(status_file, 'r', encoding='utf-8') as f:
                 status = json.load(f)
-            return status.get("status") == "alive"
+            if status.get("status") != "alive":
+                return False
+
+            run_state_file = os.path.join(self.simulation_dir, "run_state.json")
+            if not os.path.exists(run_state_file):
+                return True
+
+            with open(run_state_file, 'r', encoding='utf-8') as f:
+                run_state = json.load(f)
+            process_pid = run_state.get("process_pid")
+            if not process_pid:
+                return False
+
+            try:
+                os.kill(int(process_pid), 0)
+                return True
+            except (OSError, ValueError, TypeError):
+                return False
         except (json.JSONDecodeError, OSError):
             return False
 

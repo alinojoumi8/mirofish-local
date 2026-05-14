@@ -241,7 +241,7 @@ const loadProject = async () => {
       } else if (res.data.status === 'graph_building' && res.data.graph_build_task_id) {
         currentPhase.value = 1
         startPollingTask(res.data.graph_build_task_id)
-        startGraphPolling()
+        startGraphPolling({ intervalMs: 60000 })
       } else if (res.data.status === 'graph_completed' && res.data.graph_id) {
         currentPhase.value = 2
         await loadGraph(res.data.graph_id)
@@ -271,13 +271,13 @@ const updatePhaseByStatus = (status) => {
 const startBuildGraph = async () => {
   try {
     currentPhase.value = 1
-    buildProgress.value = { progress: 0, message: 'Starting build...' }
+    buildProgress.value = { progress: 0, message: 'Starting build...', detail: {} }
     addLog('Initiating graph build...')
     
     const res = await buildGraph({ project_id: currentProjectId.value })
     if (res.success) {
       addLog(`Graph build task started. Task ID: ${res.data.task_id}`)
-      startGraphPolling()
+      startGraphPolling({ intervalMs: 60000 })
       startPollingTask(res.data.task_id)
     } else {
       error.value = res.error
@@ -289,10 +289,13 @@ const startBuildGraph = async () => {
   }
 }
 
-const startGraphPolling = () => {
-  addLog('Started polling for graph data...')
-  fetchGraphData()
-  graphPollTimer = setInterval(fetchGraphData, 10000)
+const startGraphPolling = ({ intervalMs = 60000, fetchImmediately = false } = {}) => {
+  stopGraphPolling()
+  addLog(`Started slow graph data polling every ${Math.round(intervalMs / 1000)}s during build...`)
+  if (fetchImmediately) {
+    fetchGraphData()
+  }
+  graphPollTimer = setInterval(fetchGraphData, intervalMs)
 }
 
 const fetchGraphData = async () => {
@@ -329,7 +332,14 @@ const pollTaskStatus = async (taskId) => {
         addLog(task.message)
       }
       
-      buildProgress.value = { progress: task.progress || 0, message: task.message }
+      buildProgress.value = {
+        progress: task.progress || 0,
+        message: task.message,
+        detail: {
+          ...(task.progress_detail || {}),
+          profile: task.result?.profile || task.progress_detail?.profile
+        }
+      }
       
       if (task.status === 'completed') {
         addLog('Graph build task completed.')

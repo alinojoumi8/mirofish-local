@@ -6,12 +6,14 @@ Uses GraphStorage (Neo4j) to replace Zep Cloud API.
 import time
 import logging
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, Any, List, Optional, Callable
 from dataclasses import dataclass
 
 from ..config import Config
 from ..models.task import TaskManager, TaskStatus
 from ..storage import GraphStorage
+from ..storage.extraction_cache import ExtractionCache
 from .text_processor import TextProcessor
 
 logger = logging.getLogger('mirofish.graph_builder')
@@ -43,15 +45,16 @@ class GraphBuilderService:
     def __init__(self, storage: GraphStorage):
         self.storage = storage
         self.task_manager = TaskManager()
+        self.last_build_profile: Dict[str, Any] = {}
 
     def build_graph_async(
         self,
         text: str,
         ontology: Dict[str, Any],
         graph_name: str = "MiroFish Graph",
-        chunk_size: int = 500,
-        chunk_overlap: int = 50,
-        batch_size: int = 3
+        chunk_size: int = Config.DEFAULT_CHUNK_SIZE,
+        chunk_overlap: int = Config.DEFAULT_CHUNK_OVERLAP,
+        batch_size: int = Config.GRAPH_BUILD_BATCH_SIZE,
     ) -> str:
         """
         Build graph asynchronously
@@ -131,14 +134,21 @@ class GraphBuilderService:
                 message=f"Text split into {total_chunks} chunks"
             )
 
+            cache_context = {
+                "file_hash": ExtractionCache.hash_text(text),
+                "ontology_hash": ExtractionCache.hash_ontology(ontology),
+            }
+
             # 4. Send data in batches (NER + embedding + Neo4j insert — synchronous)
             episode_uuids = self.add_text_batches(
                 graph_id, chunks, batch_size,
-                lambda msg, prog: self.task_manager.update_task(
+                lambda msg, prog, detail=None: self.task_manager.update_task(
                     task_id,
-                    progress=20 + int(prog * 0.6),  # 20-80%
-                    message=msg
-                )
+                    progress=20 + int(prog * 60),  # 20-80%
+                    message=msg,
+                    progress_detail=detail or {},
+                ),
+                cache_context=cache_context,
             )
 
             # 5. Wait for processing (no-op for Neo4j — already synchronous)
@@ -158,6 +168,7 @@ class GraphBuilderService:
                 "graph_id": graph_id,
                 "graph_info": graph_info.to_dict(),
                 "chunks_processed": total_chunks,
+                "profile": self.last_build_profile,
             })
 
         except Exception as e:
@@ -187,53 +198,283 @@ class GraphBuilderService:
         graph_id: str,
         chunks: List[str],
         batch_size: int = 3,
-        progress_callback: Optional[Callable] = None
+        progress_callback: Optional[Callable] = None,
+        cache_context: Optional[Dict[str, Any]] = None,
     ) -> List[str]:
         """Add text in batches to graph, return uuid list of all episodes"""
-        episode_uuids = []
         total_chunks = len(chunks)
+        if total_chunks == 0:
+            self.last_build_profile = self._new_build_profile(
+                total_chunks=0,
+                total_batches=0,
+                batch_size=max(1, int(batch_size)),
+                llm_concurrency=0,
+            )
+            return []
+        batch_size = max(1, int(batch_size))
         total_batches = (total_chunks + batch_size - 1) // batch_size
+        llm_concurrency = self._resolve_llm_concurrency(total_batches)
+        started_at = time.perf_counter()
+        profile = self._new_build_profile(
+            total_chunks=total_chunks,
+            total_batches=total_batches,
+            batch_size=batch_size,
+            llm_concurrency=llm_concurrency,
+        )
+        batch_jobs = []
 
-        logger.info(f"[graph_build] Starting: {total_chunks} chunks, {total_batches} batches (batch_size={batch_size})")
+        logger.info(
+            "[graph_build] Starting: %s chunks, %s batches (batch_size=%s, concurrency=%s)",
+            total_chunks,
+            total_batches,
+            batch_size,
+            llm_concurrency,
+        )
 
         for i in range(0, total_chunks, batch_size):
             batch_chunks = chunks[i:i + batch_size]
             batch_num = i // batch_size + 1
+            batch_jobs.append(
+                {
+                    "batch_index": batch_num - 1,
+                    "batch_num": batch_num,
+                    "first_chunk": i + 1,
+                    "last_chunk": i + len(batch_chunks),
+                    "chunks": batch_chunks,
+                }
+            )
 
-            if progress_callback:
-                progress = (i + len(batch_chunks)) / total_chunks
-                progress_callback(
-                    f"Processing batch {batch_num}/{total_batches} ({len(batch_chunks)} chunks)...",
-                    progress
-                )
+        processed_chunks = 0
+        results_by_batch: Dict[int, List[str]] = {}
 
-            for j, chunk in enumerate(batch_chunks):
-                chunk_idx = i + j + 1
-                chunk_preview = chunk[:80].replace('\n', ' ')
-                logger.info(
-                    f"[graph_build] Chunk {chunk_idx}/{total_chunks} "
-                    f"({len(chunk)} chars): \"{chunk_preview}...\""
-                )
-                t0 = time.time()
+        with ThreadPoolExecutor(max_workers=llm_concurrency) as executor:
+            futures = {
+                executor.submit(
+                    self._add_batch_with_retry,
+                    graph_id,
+                    job["chunks"],
+                    job["batch_num"],
+                    total_batches,
+                    cache_context,
+                ): job
+                for job in batch_jobs
+            }
+
+            for future in as_completed(futures):
+                job = futures[future]
+                batch_num = job["batch_num"]
+                t0 = time.perf_counter()
                 try:
-                    episode_id = self.storage.add_text(graph_id, chunk)
-                    episode_uuids.append(episode_id)
-                    elapsed = time.time() - t0
-                    logger.info(
-                        f"[graph_build] Chunk {chunk_idx}/{total_chunks} done in {elapsed:.1f}s"
-                    )
+                    batch_episode_ids, batch_profile, batch_elapsed = future.result()
                 except Exception as e:
-                    elapsed = time.time() - t0
+                    elapsed = time.perf_counter() - t0
+                    profile["failed_batches"] += 1
                     logger.error(
-                        f"[graph_build] Chunk {chunk_idx}/{total_chunks} FAILED "
-                        f"after {elapsed:.1f}s: {e}"
+                        "[graph_build] Batch %s/%s FAILED after %.1fs: %s",
+                        batch_num,
+                        total_batches,
+                        elapsed,
+                        e,
                     )
-                    if progress_callback:
-                        progress_callback(f"Batch {batch_num} processing failed: {str(e)}", 0)
+                    self._emit_progress(
+                        progress_callback,
+                        f"Batch {batch_num}/{total_batches} failed: {str(e)}",
+                        processed_chunks / total_chunks,
+                        {
+                            "current_chunk": processed_chunks,
+                            "total_chunks": total_chunks,
+                            "batch_number": batch_num,
+                            "total_batches": total_batches,
+                            "llm_concurrency": llm_concurrency,
+                            "eta_seconds": None,
+                        },
+                    )
+                    self.last_build_profile = profile
                     raise
+
+                results_by_batch[job["batch_index"]] = batch_episode_ids
+                self._merge_profile(profile, batch_profile)
+                profile["batch_wall_seconds"] += batch_elapsed
+                processed_chunks += len(job["chunks"])
+                total_elapsed = time.perf_counter() - started_at
+                avg_seconds = total_elapsed / processed_chunks if processed_chunks else 0.0
+                eta_seconds = max(total_chunks - processed_chunks, 0) * avg_seconds
+                progress = processed_chunks / total_chunks
+                detail = {
+                    "current_chunk": processed_chunks,
+                    "total_chunks": total_chunks,
+                    "batch_number": batch_num,
+                    "total_batches": total_batches,
+                    "batch_size": len(job["chunks"]),
+                    "llm_concurrency": llm_concurrency,
+                    "batch_seconds": round(batch_elapsed, 2),
+                    "elapsed_seconds": round(total_elapsed, 2),
+                    "avg_seconds_per_chunk": round(avg_seconds, 2),
+                    "eta_seconds": round(eta_seconds, 2),
+                    "profile": self._rounded_profile(profile, total_elapsed),
+                }
+                message = (
+                    f"Processed chunks {processed_chunks}/{total_chunks} "
+                    f"(batch {batch_num}/{total_batches}); "
+                    f"avg {avg_seconds:.1f}s/chunk; ETA {self._format_eta(eta_seconds)}"
+                )
+                logger.info("[graph_build] %s", message)
+                self._emit_progress(progress_callback, message, progress, detail)
+
+        total_elapsed = time.perf_counter() - started_at
+        self.last_build_profile = self._rounded_profile(profile, total_elapsed)
+
+        episode_uuids: List[str] = []
+        for batch_index in range(total_batches):
+            episode_uuids.extend(results_by_batch.get(batch_index, []))
 
         logger.info(f"[graph_build] All {total_chunks} chunks processed successfully")
         return episode_uuids
+
+    def _add_batch_with_retry(
+        self,
+        graph_id: str,
+        batch_chunks: List[str],
+        batch_num: int,
+        total_batches: int,
+        cache_context: Optional[Dict[str, Any]],
+    ) -> tuple[List[str], Dict[str, Any], float]:
+        """Run one storage batch with retry/backoff and return ids, profile, elapsed seconds."""
+        first_chunk = batch_num
+        last_error: Optional[Exception] = None
+        attempts = max(0, int(Config.GRAPH_BUILD_BATCH_RETRIES)) + 1
+        for attempt in range(attempts):
+            batch_profile: Dict[str, Any] = {}
+            t0 = time.perf_counter()
+            try:
+                logger.info(
+                    "[graph_build] Batch %s/%s attempt %s/%s (%s chunks)",
+                    batch_num,
+                    total_batches,
+                    attempt + 1,
+                    attempts,
+                    len(batch_chunks),
+                )
+                batch_episode_ids = self.storage.add_text_batch(
+                    graph_id,
+                    batch_chunks,
+                    batch_size=len(batch_chunks),
+                    cache_context=cache_context,
+                    profile_callback=batch_profile.update,
+                )
+                return batch_episode_ids, batch_profile, time.perf_counter() - t0
+            except Exception as e:
+                last_error = e
+                elapsed = time.perf_counter() - t0
+                if attempt >= attempts - 1:
+                    logger.error(
+                        "[graph_build] Batch %s/%s failed permanently after %.1fs: %s",
+                        batch_num,
+                        total_batches,
+                        elapsed,
+                        e,
+                    )
+                    break
+                wait_seconds = max(0.0, Config.GRAPH_BUILD_BATCH_RETRY_BASE_SECONDS * (2 ** attempt))
+                logger.warning(
+                    "[graph_build] Batch %s/%s failed after %.1fs; retrying in %.1fs: %s",
+                    batch_num,
+                    total_batches,
+                    elapsed,
+                    wait_seconds,
+                    e,
+                )
+                time.sleep(wait_seconds)
+        raise last_error or RuntimeError(f"Batch {first_chunk} failed")
+
+    def _resolve_llm_concurrency(self, total_batches: int) -> int:
+        if total_batches <= 0:
+            return 0
+        configured = int(getattr(Config, "GRAPH_BUILD_LLM_CONCURRENCY", 0) or 0)
+        if configured > 0:
+            return max(1, min(configured, total_batches))
+        provider = (getattr(Config, "LLM_DEFAULT_PROVIDER", "") or "").lower()
+        base_url = (getattr(Config, "LLM_BASE_URL", "") or "").lower()
+        is_local = (
+            provider == "ollama"
+            or "localhost" in base_url
+            or "127.0.0.1" in base_url
+            or "ollama" in base_url
+            or ":11434" in base_url
+        )
+        fallback = (
+            getattr(Config, "GRAPH_BUILD_LOCAL_LLM_CONCURRENCY", 1)
+            if is_local
+            else getattr(Config, "GRAPH_BUILD_CLOUD_LLM_CONCURRENCY", 3)
+        )
+        return max(1, min(int(fallback), total_batches))
+
+    def _new_build_profile(
+        self,
+        total_chunks: int,
+        total_batches: int,
+        batch_size: int,
+        llm_concurrency: int,
+    ) -> Dict[str, Any]:
+        return {
+            "total_chunks": total_chunks,
+            "total_batches": total_batches,
+            "batch_size": batch_size,
+            "llm_concurrency": llm_concurrency,
+            "llm_extraction_seconds": 0.0,
+            "embedding_seconds": 0.0,
+            "neo4j_write_seconds": 0.0,
+            "batch_wall_seconds": 0.0,
+            "total_wall_seconds": 0.0,
+            "cache_hits": 0,
+            "cache_misses": 0,
+            "failed_batches": 0,
+        }
+
+    def _merge_profile(self, target: Dict[str, Any], source: Dict[str, Any]) -> None:
+        for key in (
+            "llm_extraction_seconds",
+            "embedding_seconds",
+            "neo4j_write_seconds",
+            "cache_hits",
+            "cache_misses",
+            "failed_batches",
+        ):
+            value = source.get(key, 0) if source else 0
+            target[key] = target.get(key, 0) + value
+
+    def _rounded_profile(self, profile: Dict[str, Any], total_elapsed: float) -> Dict[str, Any]:
+        result = dict(profile)
+        result["total_wall_seconds"] = total_elapsed
+        for key, value in list(result.items()):
+            if isinstance(value, float):
+                result[key] = round(value, 4)
+        return result
+
+    def _emit_progress(
+        self,
+        progress_callback: Optional[Callable],
+        message: str,
+        progress: float,
+        detail: Dict[str, Any],
+    ) -> None:
+        if not progress_callback:
+            return
+        try:
+            progress_callback(message, progress, detail)
+        except TypeError:
+            progress_callback(message, progress)
+
+    def _format_eta(self, seconds: float) -> str:
+        if seconds <= 0:
+            return "0s"
+        minutes, sec = divmod(int(seconds), 60)
+        hours, minutes = divmod(minutes, 60)
+        if hours:
+            return f"{hours}h {minutes}m"
+        if minutes:
+            return f"{minutes}m {sec}s"
+        return f"{sec}s"
 
     def _get_graph_info(self, graph_id: str) -> GraphInfo:
         """Get graph information"""

@@ -336,6 +336,17 @@
                   <span class="progress-message">{{ buildProgress.message }}</span>
                   <span class="progress-percent">{{ buildProgress.progress }}%</span>
                 </div>
+                <div class="progress-detail" v-if="buildProgress.detail?.total_chunks">
+                  <span>Chunk {{ buildProgress.detail.current_chunk }}/{{ buildProgress.detail.total_chunks }}</span>
+                  <span>Avg {{ buildProgress.detail.avg_seconds_per_chunk }}s</span>
+                  <span>ETA {{ formatDuration(buildProgress.detail.eta_seconds) }}</span>
+                  <span v-if="buildProgress.detail.llm_concurrency">LLM x{{ buildProgress.detail.llm_concurrency }}</span>
+                </div>
+                <div class="progress-detail" v-if="buildProgress.detail?.profile">
+                  <span>LLM {{ formatDuration(buildProgress.detail.profile.llm_extraction_seconds) }}</span>
+                  <span>Embed {{ formatDuration(buildProgress.detail.profile.embedding_seconds) }}</span>
+                  <span>Neo4j {{ formatDuration(buildProgress.detail.profile.neo4j_write_seconds) }}</span>
+                </div>
               </div>
               
               <div class="detail-section" v-if="graphData">
@@ -515,6 +526,18 @@ const formatDate = (dateStr) => {
   }
 }
 
+const formatDuration = (seconds) => {
+  if (seconds === null || seconds === undefined || Number.isNaN(Number(seconds))) return '--'
+  const totalSeconds = Math.max(0, Math.round(Number(seconds)))
+  const minutes = Math.floor(totalSeconds / 60)
+  const remainingSeconds = totalSeconds % 60
+  const hours = Math.floor(minutes / 60)
+  const remainingMinutes = minutes % 60
+  if (hours > 0) return `${hours}h ${remainingMinutes}m`
+  if (minutes > 0) return `${minutes}m ${remainingSeconds}s`
+  return `${remainingSeconds}s`
+}
+
 // Select node
 const selectNode = (nodeData, color) => {
   selectedItem.value = {
@@ -680,7 +703,8 @@ const startBuildGraph = async () => {
     // Initialize progress
     buildProgress.value = {
       progress: 0,
-      message: 'Starting graph build...'
+      message: 'Starting graph build...',
+      detail: {}
     }
 
     const response = await buildGraph({ project_id: currentProjectId.value })
@@ -691,8 +715,8 @@ const startBuildGraph = async () => {
       // Save task_id for polling
       const taskId = response.data.task_id
 
-      // Start graph data polling (independent from task status polling)
-      startGraphPolling()
+      // Slow graph data polling while extraction is running; task polling carries progress.
+      startGraphPolling({ intervalMs: 60000 })
 
       // Start task status polling
       startPollingTask(taskId)
@@ -711,14 +735,16 @@ const startBuildGraph = async () => {
 let graphPollTimer = null
 
 // Start graph data polling
-const startGraphPolling = () => {
-  // Fetch once immediately
-  fetchGraphData()
+const startGraphPolling = ({ intervalMs = 60000, fetchImmediately = false } = {}) => {
+  stopGraphPolling()
+  if (fetchImmediately) {
+    fetchGraphData()
+  }
 
-  // Auto-fetch graph data every 10 seconds
+  // Keep graph data polling light during build; the final graph is loaded on completion.
   graphPollTimer = setInterval(async () => {
     await fetchGraphData()
-  }, 10000)
+  }, intervalMs)
 }
 
 // Manually refresh graph
@@ -791,7 +817,11 @@ const pollTaskStatus = async (taskId) => {
       // Update progress display
       buildProgress.value = {
         progress: task.progress || 0,
-        message: task.message || 'Processing...'
+        message: task.message || 'Processing...',
+        detail: {
+          ...(task.progress_detail || {}),
+          profile: task.result?.profile || task.progress_detail?.profile
+        }
       }
 
       console.log('Task status:', task.status, 'Progress:', task.progress)
@@ -806,7 +836,11 @@ const pollTaskStatus = async (taskId) => {
         // Update progress display to complete status
         buildProgress.value = {
           progress: 100,
-          message: 'Build complete, loading graph...'
+          message: 'Build complete, loading graph...',
+          detail: {
+            ...(task.progress_detail || {}),
+            profile: task.result?.profile || task.progress_detail?.profile
+          }
         }
 
         // Reload project data to get graph_id
@@ -822,8 +856,6 @@ const pollTaskStatus = async (taskId) => {
           }
         }
 
-        // Clear progress display
-        buildProgress.value = null
       } else if (task.status === 'failed') {
         stopPolling()
         stopGraphPolling()
@@ -1908,6 +1940,16 @@ onUnmounted(() => {
 .progress-percent {
   color: #FF6B35;
   font-weight: 600;
+}
+
+.progress-detail {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+  margin-top: 8px;
+  color: #777;
+  font-size: 0.72rem;
+  font-family: 'JetBrains Mono', monospace;
 }
 
 /* Build Results */

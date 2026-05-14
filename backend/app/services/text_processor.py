@@ -17,8 +17,8 @@ class TextProcessor:
     @staticmethod
     def split_text(
         text: str,
-        chunk_size: int = 500,
-        overlap: int = 50
+        chunk_size: int = 3000,
+        overlap: int = 200
     ) -> List[str]:
         """
         Split text

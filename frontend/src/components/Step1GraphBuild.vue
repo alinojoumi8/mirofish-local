@@ -124,6 +124,28 @@
           <p class="description">
             Based on the generated ontology, automatically chunk documents and invoke Neo4j to build knowledge graphs, extract entities and relationships, and form temporal memory and community summaries
           </p>
+
+          <div v-if="currentPhase === 1 && buildProgress" class="graph-progress">
+            <div class="graph-progress-row">
+              <span class="graph-progress-message">{{ buildProgress.message || 'Processing graph...' }}</span>
+              <span class="graph-progress-percent">{{ buildProgress.progress || 0 }}%</span>
+            </div>
+            <div class="graph-progress-bar">
+              <div class="graph-progress-fill" :style="{ width: `${buildProgress.progress || 0}%` }"></div>
+            </div>
+            <div v-if="hasChunkProgress" class="graph-progress-metrics">
+              <span>Chunk {{ progressDetail.current_chunk }}/{{ progressDetail.total_chunks }}</span>
+              <span>Avg {{ progressDetail.avg_seconds_per_chunk }}s</span>
+              <span>ETA {{ formatDuration(progressDetail.eta_seconds) }}</span>
+              <span v-if="progressDetail.llm_concurrency">LLM x{{ progressDetail.llm_concurrency }}</span>
+            </div>
+            <div v-if="hasProfile" class="graph-progress-profile">
+              <span>LLM {{ formatDuration(profileDetail.llm_extraction_seconds) }}</span>
+              <span>Embed {{ formatDuration(profileDetail.embedding_seconds) }}</span>
+              <span>Neo4j {{ formatDuration(profileDetail.neo4j_write_seconds) }}</span>
+              <span v-if="profileDetail.cache_hits !== undefined">Cache {{ profileDetail.cache_hits }}/{{ profileDetail.cache_hits + (profileDetail.cache_misses || 0) }}</span>
+            </div>
+          </div>
           
           <!-- Stats Cards -->
           <div class="stats-grid">
@@ -253,6 +275,31 @@ const graphStats = computed(() => {
   const types = props.projectData?.ontology?.entity_types?.length || 0
   return { nodes, edges, types }
 })
+
+const progressDetail = computed(() => props.buildProgress?.detail || props.buildProgress?.progress_detail || {})
+const profileDetail = computed(() => progressDetail.value.profile || props.buildProgress?.result?.profile || {})
+
+const hasChunkProgress = computed(() => {
+  return progressDetail.value.current_chunk !== undefined && progressDetail.value.total_chunks
+})
+
+const hasProfile = computed(() => {
+  return profileDetail.value.llm_extraction_seconds !== undefined
+    || profileDetail.value.embedding_seconds !== undefined
+    || profileDetail.value.neo4j_write_seconds !== undefined
+})
+
+const formatDuration = (seconds) => {
+  if (seconds === null || seconds === undefined || Number.isNaN(Number(seconds))) return '--'
+  const totalSeconds = Math.max(0, Math.round(Number(seconds)))
+  const minutes = Math.floor(totalSeconds / 60)
+  const remainingSeconds = totalSeconds % 60
+  const hours = Math.floor(minutes / 60)
+  const remainingMinutes = minutes % 60
+  if (hours > 0) return `${hours}h ${remainingMinutes}m`
+  if (minutes > 0) return `${minutes}m ${remainingSeconds}s`
+  return `${remainingSeconds}s`
+}
 
 const formatDate = (dateStr) => {
   if (!dateStr) return '--:--:--'
@@ -569,6 +616,70 @@ watch(() => props.systemLogs.length, () => {
 }
 
 /* Step 02 Stats */
+.graph-progress {
+  margin-bottom: 14px;
+  padding: 12px;
+  background: #FFF7F3;
+  border: 1px solid #FFE0D2;
+  border-radius: 6px;
+}
+
+.graph-progress-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 12px;
+}
+
+.graph-progress-message {
+  color: #333;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.graph-progress-percent {
+  color: #FF5722;
+  font-family: 'JetBrains Mono', monospace;
+  font-weight: 700;
+  flex-shrink: 0;
+}
+
+.graph-progress-bar {
+  height: 6px;
+  background: #FFE7DE;
+  border-radius: 999px;
+  overflow: hidden;
+  margin-top: 10px;
+}
+
+.graph-progress-fill {
+  height: 100%;
+  background: #FF5722;
+  border-radius: inherit;
+  transition: width 0.3s ease;
+}
+
+.graph-progress-metrics {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+  margin-top: 10px;
+  color: #666;
+  font-size: 11px;
+  font-family: 'JetBrains Mono', monospace;
+}
+
+.graph-progress-profile {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+  margin-top: 8px;
+  color: #777;
+  font-size: 10px;
+  font-family: 'JetBrains Mono', monospace;
+}
+
 .stats-grid {
   display: grid;
   grid-template-columns: 1fr 1fr 1fr;

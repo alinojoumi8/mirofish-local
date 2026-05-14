@@ -316,7 +316,10 @@ class SimulationRunner:
         max_rounds: int = None,  # Maximum simulation rounds (optional, for truncating long simulations)
         enable_graph_memory_update: bool = False,  # Whether to update activities to the graph
         graph_id: str = None,  # Graph ID (required when enabling graph updates)
-        storage: 'GraphStorage' = None  # GraphStorage instance (required if enable_graph_memory_update)
+        storage: 'GraphStorage' = None,  # GraphStorage instance (required if enable_graph_memory_update)
+        scenario_id: str = None,
+        seed: Union[int, str, None] = None,
+        memory_mode: str = None,
     ) -> SimulationRunState:
         """
         Start simulation
@@ -345,6 +348,23 @@ class SimulationRunner:
         
         with open(config_path, 'r', encoding='utf-8') as f:
             config = json.load(f)
+
+        config_changed = False
+        if scenario_id:
+            config["active_scenario_id"] = scenario_id
+            config_changed = True
+        if seed is not None:
+            try:
+                config["seed"] = int(seed)
+            except (TypeError, ValueError):
+                config["seed"] = str(seed)
+            config_changed = True
+        if memory_mode:
+            config["memory_mode"] = memory_mode
+            config_changed = True
+        if config_changed:
+            with open(config_path, 'w', encoding='utf-8') as f:
+                json.dump(config, f, ensure_ascii=False, indent=2)
         
         # Initialize run state
         time_config = config.get("time_config", {})

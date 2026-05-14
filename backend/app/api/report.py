@@ -11,6 +11,11 @@ from flask import request, jsonify, send_file, current_app
 from . import report_bp
 from ..config import Config
 from ..services.report_agent import ReportAgent, ReportManager, ReportStatus, normalize_report_mode
+from ..services.forecasting import (
+    infer_report_mode_from_forecast,
+    load_simulation_config,
+    normalize_forecast_settings,
+)
 from ..services.simulation_manager import SimulationManager
 from ..models.project import ProjectManager
 from ..models.task import TaskManager, TaskStatus
@@ -41,11 +46,22 @@ def generate_report():
             return jsonify({"success": False, "error": "Please provide simulation_id"}), 400
 
         force_regenerate = data.get('force_regenerate', False)
-        report_mode = normalize_report_mode(data.get('report_mode'))
+        requested_report_mode = data.get('report_mode')
+        report_mode = normalize_report_mode(requested_report_mode)
         manager = SimulationManager()
         state = manager.get_simulation(simulation_id)
         if not state:
             return jsonify({"success": False, "error": f"Simulation does not exist: {simulation_id}"}), 404
+
+        simulation_config = load_simulation_config(simulation_id)
+        if not requested_report_mode:
+            forecast_settings = normalize_forecast_settings(
+                simulation_config,
+                simulation_requirement=simulation_config.get("simulation_requirement", ""),
+            )
+            report_mode = normalize_report_mode(
+                infer_report_mode_from_forecast(forecast_settings.forecast_mode)
+            )
 
         if not force_regenerate:
             existing_report = ReportManager.get_report_by_simulation(simulation_id)
@@ -129,7 +145,12 @@ def generate_report():
                 report = agent.generate_report(progress_callback=progress_callback, report_id=report_id)
                 ReportManager.save_report(report)
                 if report.status in [ReportStatus.COMPLETED, ReportStatus.NEEDS_REVIEW]:
-                    task_manager.complete_task(task_id, result={"report_id": report.report_id, "simulation_id": simulation_id, "status": report.status.value})
+                    task_manager.complete_task(task_id, result={
+                        "report_id": report.report_id,
+                        "simulation_id": simulation_id,
+                        "status": report.status.value,
+                        "forecast": report.forecast,
+                    })
                 else:
                     task_manager.fail_task(task_id, report.error or "Report generation failed")
             except Exception as e:

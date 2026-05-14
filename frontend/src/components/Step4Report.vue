@@ -13,6 +13,27 @@
             </div>
             <h1 class="main-title">{{ reportOutline.title }}</h1>
             <p class="sub-title">{{ reportOutline.summary }}</p>
+            <div v-if="forecastRows.length" class="forecast-summary-panel">
+              <div class="forecast-summary-head">
+                <span class="forecast-summary-title">Forecast probabilities</span>
+                <span class="forecast-summary-meta mono">{{ forecastData?.forecast_mode || reportMode }} · {{ forecastData?.confidence || 'low' }}</span>
+              </div>
+              <div class="forecast-probability-list">
+                <div v-for="row in forecastRows" :key="row.outcome" class="forecast-probability-row">
+                  <div class="forecast-row-main">
+                    <span class="forecast-outcome">{{ row.outcome }}</span>
+                    <span class="forecast-percent mono">{{ row.percent }}</span>
+                  </div>
+                  <div class="forecast-bar-track">
+                    <div class="forecast-bar-fill" :style="{ width: row.percent }"></div>
+                  </div>
+                  <p class="forecast-rationale">{{ row.rationale }}</p>
+                </div>
+              </div>
+              <div v-if="forecastData?.missing_information?.length" class="forecast-missing">
+                Missing: {{ forecastData.missing_information.slice(0, 2).join('; ') }}
+              </div>
+            </div>
             <div class="header-divider"></div>
           </div>
 
@@ -120,6 +141,10 @@
             <div class="metric">
               <span class="metric-label">Tools</span>
               <span class="metric-value mono">{{ totalToolCalls }}</span>
+            </div>
+            <div class="metric" v-if="forecastRows.length">
+              <span class="metric-label">Forecast</span>
+              <span class="metric-value mono">{{ topForecastPercent }}</span>
             </div>
             <div class="metric metric-right">
               <span class="metric-pill" :class="`pill--${statusClass}`">{{ statusText }}</span>
@@ -500,6 +525,7 @@ const reportStatus = ref('pending')
 const reportQuality = ref(null)
 const reportProgress = ref(null)
 const graphQuality = ref(null)
+const forecastData = ref(null)
 const reportSimulationId = ref(props.simulationId || null)
 const reportGraphId = ref(null)
 const reportMode = ref('prediction')
@@ -1829,6 +1855,20 @@ const reportModeLabel = computed(() => {
   return labels[reportMode.value] || reportMode.value
 })
 
+const forecastRows = computed(() => {
+  return (forecastData.value?.probabilities || []).map((row) => {
+    const probability = Number(row.probability || 0)
+    return {
+      ...row,
+      percent: `${Math.round(probability * 100)}%`
+    }
+  })
+})
+
+const topForecastPercent = computed(() => {
+  return forecastRows.value[0]?.percent || '-'
+})
+
 const benchmarkRows = computed(() => {
   return (benchmarkResult.value?.providers || []).map((provider) => {
     const queryErrors = (provider.queries || []).filter((query) => query.error).length
@@ -2329,6 +2369,7 @@ const fetchReportSnapshot = async () => {
       const report = reportRes.value.data
       reportStatus.value = report.status || reportStatus.value
       reportQuality.value = report.quality_score || null
+      forecastData.value = report.forecast || null
       reportSimulationId.value = report.simulation_id || reportSimulationId.value
       reportGraphId.value = report.graph_id || reportGraphId.value
       reportMode.value = report.report_mode || reportMode.value
@@ -2502,6 +2543,7 @@ watch(() => props.reportId, (newId) => {
     isComplete.value = false
     reportStatus.value = 'pending'
     reportQuality.value = null
+    forecastData.value = null
     reportProgress.value = null
     graphQuality.value = null
     reportMode.value = 'prediction'
@@ -2713,6 +2755,94 @@ watch(() => props.reportId, (newId) => {
   line-height: 1.6;
   margin: 0 0 30px 0;
   font-weight: 400;
+}
+
+.forecast-summary-panel {
+  margin: 0 0 24px 0;
+  padding: 16px;
+  border: 1px solid #E5E7EB;
+  border-radius: 6px;
+  background: #FAFAFA;
+}
+
+.forecast-summary-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.forecast-summary-title {
+  font-size: 12px;
+  font-weight: 800;
+  color: #111827;
+  text-transform: uppercase;
+}
+
+.forecast-summary-meta {
+  font-size: 10px;
+  color: #6B7280;
+  text-transform: uppercase;
+}
+
+.forecast-probability-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.forecast-probability-row {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.forecast-row-main {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: baseline;
+}
+
+.forecast-outcome {
+  font-size: 13px;
+  font-weight: 700;
+  color: #1F2937;
+}
+
+.forecast-percent {
+  font-size: 13px;
+  font-weight: 800;
+  color: #111827;
+}
+
+.forecast-bar-track {
+  height: 6px;
+  border-radius: 999px;
+  background: #E5E7EB;
+  overflow: hidden;
+}
+
+.forecast-bar-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: #047857;
+}
+
+.forecast-rationale {
+  margin: 0;
+  font-size: 12px;
+  color: #6B7280;
+  line-height: 1.45;
+}
+
+.forecast-missing {
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px dashed #D1D5DB;
+  font-size: 12px;
+  color: #92400E;
 }
 
 .header-divider {

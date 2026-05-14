@@ -59,8 +59,20 @@ class Config:
     ALLOWED_EXTENSIONS = {'pdf', 'md', 'txt', 'markdown'}
 
     # Text processing configuration
-    DEFAULT_CHUNK_SIZE = 500  # Default chunk size
-    DEFAULT_CHUNK_OVERLAP = 50  # Default overlap size
+    DEFAULT_CHUNK_SIZE = int(os.environ.get('GRAPH_BUILD_CHUNK_SIZE', '3000'))
+    DEFAULT_CHUNK_OVERLAP = int(os.environ.get('GRAPH_BUILD_CHUNK_OVERLAP', '200'))
+    GRAPH_BUILD_BATCH_SIZE = int(os.environ.get('GRAPH_BUILD_BATCH_SIZE', '8'))
+    # 0 means auto: local Ollama stays conservative, cloud providers use more concurrency.
+    GRAPH_BUILD_LLM_CONCURRENCY = int(os.environ.get('GRAPH_BUILD_LLM_CONCURRENCY', '0'))
+    GRAPH_BUILD_LOCAL_LLM_CONCURRENCY = int(os.environ.get('GRAPH_BUILD_LOCAL_LLM_CONCURRENCY', '1'))
+    GRAPH_BUILD_CLOUD_LLM_CONCURRENCY = int(os.environ.get('GRAPH_BUILD_CLOUD_LLM_CONCURRENCY', '3'))
+    GRAPH_BUILD_BATCH_RETRIES = int(os.environ.get('GRAPH_BUILD_BATCH_RETRIES', '2'))
+    GRAPH_BUILD_BATCH_RETRY_BASE_SECONDS = float(os.environ.get('GRAPH_BUILD_BATCH_RETRY_BASE_SECONDS', '2'))
+    GRAPH_EXTRACTION_CACHE_ENABLED = os.environ.get('GRAPH_EXTRACTION_CACHE_ENABLED', 'True').lower() == 'true'
+    GRAPH_EXTRACTION_CACHE_DIR = os.environ.get(
+        'GRAPH_EXTRACTION_CACHE_DIR',
+        os.path.join(UPLOAD_FOLDER, 'cache', 'ner_extractions')
+    )
 
     # OASIS simulation configuration
     OASIS_DEFAULT_MAX_ROUNDS = int(os.environ.get('OASIS_DEFAULT_MAX_ROUNDS', '10'))
@@ -80,7 +92,7 @@ class Config:
     REPORT_AGENT_MAX_TOOL_CALLS = int(os.environ.get('REPORT_AGENT_MAX_TOOL_CALLS', '5'))
     REPORT_AGENT_MAX_REFLECTION_ROUNDS = int(os.environ.get('REPORT_AGENT_MAX_REFLECTION_ROUNDS', '2'))
     REPORT_AGENT_TEMPERATURE = float(os.environ.get('REPORT_AGENT_TEMPERATURE', '0.5'))
-    REPORT_AGENT_INTERVIEW_TIMEOUT = float(os.environ.get('REPORT_AGENT_INTERVIEW_TIMEOUT', '45'))
+    REPORT_AGENT_INTERVIEW_TIMEOUT = float(os.environ.get('REPORT_AGENT_INTERVIEW_TIMEOUT', '240'))
 
     @classmethod
     def validate(cls):

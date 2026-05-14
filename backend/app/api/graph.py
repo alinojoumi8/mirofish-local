@@ -6,6 +6,7 @@ Uses project context mechanism with server-side state persistence
 import os
 import traceback
 import threading
+import time
 from flask import request, jsonify, current_app
 
 from . import graph_bp
@@ -14,6 +15,7 @@ from ..services.ontology_generator import OntologyGenerator
 from ..services.graph_builder import GraphBuilderService
 from ..services.embedding_benchmark import DEFAULT_QUERIES, run_embedding_benchmark
 from ..services.text_processor import TextProcessor
+from ..storage.extraction_cache import ExtractionCache
 from ..utils.file_parser import FileParser
 from ..utils.logger import get_logger
 from ..models.task import TaskManager, TaskStatus
@@ -157,6 +159,12 @@ def generate_ontology():
     """
     try:
         logger.info("=== Starting ontology generation ===")
+        phase_started = time.perf_counter()
+        phase_profile = {
+            "pdf_extraction_seconds": 0.0,
+            "ontology_seconds": 0.0,
+            "total_seconds": 0.0,
+        }
 
         # Get parameters
         simulation_requirement = request.form.get('simulation_requirement', '')
@@ -189,6 +197,7 @@ def generate_ontology():
         document_texts = []
         all_text = ""
 
+        extraction_started = time.perf_counter()
         for file in uploaded_files:
             if file and file.filename and allowed_file(file.filename):
                 # Save file to project directory
@@ -207,6 +216,7 @@ def generate_ontology():
                 text = TextProcessor.preprocess_text(text)
                 document_texts.append(text)
                 all_text += f"\n\n=== {file_info['original_filename']} ===\n{text}"
+        phase_profile["pdf_extraction_seconds"] = round(time.perf_counter() - extraction_started, 4)
 
         if not document_texts:
             ProjectManager.delete_project(project.project_id)
@@ -223,11 +233,14 @@ def generate_ontology():
         # Generate ontology
         logger.info("Calling LLM to generate ontology definition...")
         generator = OntologyGenerator()
+        ontology_started = time.perf_counter()
         ontology = generator.generate(
             document_texts=document_texts,
             simulation_requirement=simulation_requirement,
             additional_context=additional_context if additional_context else None
         )
+        phase_profile["ontology_seconds"] = round(time.perf_counter() - ontology_started, 4)
+        phase_profile["total_seconds"] = round(time.perf_counter() - phase_started, 4)
 
         # Save ontology to project
         entity_count = len(ontology.get("entity_types", []))
@@ -251,7 +264,8 @@ def generate_ontology():
                 "ontology": project.ontology,
                 "analysis_summary": project.analysis_summary,
                 "files": project.files,
-                "total_text_length": project.total_text_length
+                "total_text_length": project.total_text_length,
+                "profile": phase_profile,
             }
         })
         
@@ -274,8 +288,8 @@ def build_graph():
         {
             "project_id": "proj_xxxx",  // Required: from interface 1
             "graph_name": "Graph name",    // Optional
-            "chunk_size": 500,          // Optional, default 500
-            "chunk_overlap": 50         // Optional, default 50
+            "chunk_size": 3000,         // Optional, default 3000
+            "chunk_overlap": 200        // Optional, default 200
         }
 
     Response:
@@ -335,8 +349,25 @@ def build_graph():
 
         # Get configuration
         graph_name = data.get('graph_name', project.name or 'MiroFish Graph')
-        chunk_size = data.get('chunk_size', project.chunk_size or Config.DEFAULT_CHUNK_SIZE)
-        chunk_overlap = data.get('chunk_overlap', project.chunk_overlap or Config.DEFAULT_CHUNK_OVERLAP)
+        legacy_chunk_size = 500
+        legacy_chunk_overlap = 50
+        chunk_size = data.get('chunk_size')
+        if chunk_size is None:
+            chunk_size = (
+                Config.DEFAULT_CHUNK_SIZE
+                if not project.chunk_size or project.chunk_size == legacy_chunk_size
+                else project.chunk_size
+            )
+        chunk_overlap = data.get('chunk_overlap')
+        if chunk_overlap is None:
+            chunk_overlap = (
+                Config.DEFAULT_CHUNK_OVERLAP
+                if project.chunk_overlap is None or project.chunk_overlap == legacy_chunk_overlap
+                else project.chunk_overlap
+            )
+        chunk_size = max(1, int(chunk_size))
+        chunk_overlap = max(0, min(int(chunk_overlap), chunk_size - 1))
+        batch_size = max(1, int(data.get('batch_size', Config.GRAPH_BUILD_BATCH_SIZE)))
 
         # Update project configuration
         project.chunk_size = chunk_size
@@ -374,6 +405,17 @@ def build_graph():
         # Start background task
         def build_task():
             build_logger = get_logger('mirofish.build')
+            build_started = time.perf_counter()
+            build_profile = {
+                "chunking_seconds": 0.0,
+                "graph_create_seconds": 0.0,
+                "ontology_seconds": 0.0,
+                "llm_extraction_seconds": 0.0,
+                "embedding_seconds": 0.0,
+                "neo4j_write_seconds": 0.0,
+                "graph_data_seconds": 0.0,
+                "total_seconds": 0.0,
+            }
             try:
                 build_logger.info(f"[{task_id}] Starting graph build...")
                 task_manager.update_task(
@@ -391,20 +433,37 @@ def build_graph():
                     message="Chunking text...",
                     progress=5
                 )
+                chunk_started = time.perf_counter()
                 chunks = TextProcessor.split_text(
                     text,
                     chunk_size=chunk_size,
                     overlap=chunk_overlap
                 )
+                build_profile["chunking_seconds"] = round(time.perf_counter() - chunk_started, 4)
                 total_chunks = len(chunks)
+                file_hash = ExtractionCache.hash_text(text)
+                ontology_hash = ExtractionCache.hash_ontology(ontology)
+                progress_detail = {
+                    "current_chunk": 0,
+                    "total_chunks": total_chunks,
+                    "chunk_size": chunk_size,
+                    "chunk_overlap": chunk_overlap,
+                    "batch_size": batch_size,
+                    "file_hash": file_hash,
+                    "eta_seconds": None,
+                    "profile": build_profile,
+                }
 
                 # Create graph
                 task_manager.update_task(
                     task_id,
-                    message="Creating Zep graph...",
-                    progress=10
+                    message=f"Text split into {total_chunks} chunks. Creating Neo4j graph...",
+                    progress=10,
+                    progress_detail=progress_detail
                 )
+                graph_started = time.perf_counter()
                 graph_id = builder.create_graph(name=graph_name)
+                build_profile["graph_create_seconds"] = round(time.perf_counter() - graph_started, 4)
 
                 # Update project graph_id
                 project.graph_id = graph_id
@@ -416,44 +475,86 @@ def build_graph():
                     message="Setting ontology definition...",
                     progress=15
                 )
+                ontology_started = time.perf_counter()
                 builder.set_ontology(graph_id, ontology)
+                build_profile["ontology_seconds"] = round(time.perf_counter() - ontology_started, 4)
                 
                 # Add text (progress_callback signature is (msg, progress_ratio))
-                def add_progress_callback(msg, progress_ratio):
+                def add_progress_callback(msg, progress_ratio, detail=None):
                     progress = 15 + int(progress_ratio * 40)  # 15% - 55%
+                    latest_profile = {
+                        **build_profile,
+                        **((detail or {}).get("profile") or {}),
+                    }
+                    merged_detail = {
+                        **progress_detail,
+                        **(detail or {}),
+                        "profile": latest_profile,
+                    }
                     task_manager.update_task(
                         task_id,
                         message=msg,
-                        progress=progress
+                        progress=progress,
+                        progress_detail=merged_detail,
                     )
 
                 task_manager.update_task(
                     task_id,
-                    message=f"Starting to add {total_chunks} text chunks...",
-                    progress=15
+                    message=f"Starting graph extraction for {total_chunks} chunks...",
+                    progress=15,
+                    progress_detail=progress_detail,
                 )
 
                 episode_uuids = builder.add_text_batches(
                     graph_id,
                     chunks,
-                    batch_size=3,
-                    progress_callback=add_progress_callback
+                    batch_size=batch_size,
+                    progress_callback=add_progress_callback,
+                    cache_context={
+                        "file_hash": file_hash,
+                        "ontology_hash": ontology_hash,
+                    },
                 )
+                build_profile.update({
+                    "llm_extraction_seconds": builder.last_build_profile.get("llm_extraction_seconds", 0.0),
+                    "embedding_seconds": builder.last_build_profile.get("embedding_seconds", 0.0),
+                    "neo4j_write_seconds": builder.last_build_profile.get("neo4j_write_seconds", 0.0),
+                    "batch_wall_seconds": builder.last_build_profile.get("batch_wall_seconds", 0.0),
+                    "cache_hits": builder.last_build_profile.get("cache_hits", 0),
+                    "cache_misses": builder.last_build_profile.get("cache_misses", 0),
+                    "llm_concurrency": builder.last_build_profile.get("llm_concurrency"),
+                    "total_batches": builder.last_build_profile.get("total_batches"),
+                })
 
                 # Neo4j processing is synchronous, no need to wait
                 task_manager.update_task(
                     task_id,
                     message="Text processing completed, generating graph data...",
-                    progress=90
+                    progress=90,
+                    progress_detail={
+                        **progress_detail,
+                        "current_chunk": total_chunks,
+                        "total_chunks": total_chunks,
+                        "profile": build_profile,
+                    },
                 )
 
                 # Get graph data
                 task_manager.update_task(
                     task_id,
                     message="Retrieving graph data...",
-                    progress=95
+                    progress=95,
+                    progress_detail={
+                        **progress_detail,
+                        "current_chunk": total_chunks,
+                        "total_chunks": total_chunks,
+                        "profile": build_profile,
+                    },
                 )
+                graph_data_started = time.perf_counter()
                 graph_data = builder.get_graph_data(graph_id)
+                build_profile["graph_data_seconds"] = round(time.perf_counter() - graph_data_started, 4)
+                build_profile["total_seconds"] = round(time.perf_counter() - build_started, 4)
 
                 # Update project status
                 project.status = ProjectStatus.GRAPH_COMPLETED
@@ -469,12 +570,22 @@ def build_graph():
                     status=TaskStatus.COMPLETED,
                     message="Graph build completed",
                     progress=100,
+                    progress_detail={
+                        **progress_detail,
+                        "current_chunk": total_chunks,
+                        "total_chunks": total_chunks,
+                        "profile": build_profile,
+                    },
                     result={
                         "project_id": project_id,
                         "graph_id": graph_id,
                         "node_count": node_count,
                         "edge_count": edge_count,
-                        "chunk_count": total_chunks
+                        "chunk_count": total_chunks,
+                        "chunk_size": chunk_size,
+                        "chunk_overlap": chunk_overlap,
+                        "batch_size": batch_size,
+                        "profile": build_profile,
                     }
                 )
 

@@ -1173,11 +1173,15 @@ Return the sub-questions as a JSON list."""
 
             logger.info(f"Calling batch interview API (dual platform): {len(interviews_request)} Agents")
 
+            interview_timeout = max(
+                Config.REPORT_AGENT_INTERVIEW_TIMEOUT,
+                float(len(interviews_request) * 45),
+            )
             api_result = SimulationRunner.interview_agents_batch(
                 simulation_id=simulation_id,
                 interviews=interviews_request,
                 platform=None,
-                timeout=Config.REPORT_AGENT_INTERVIEW_TIMEOUT
+                timeout=interview_timeout
             )
 
             logger.info(f"Interview API returned: {api_result.get('interviews_count', 0)} results, success={api_result.get('success')}")

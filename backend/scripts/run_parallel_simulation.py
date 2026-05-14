@@ -156,10 +156,16 @@ def init_logging_for_simulation(simulation_dir: str):
 
 
 from action_logger import SimulationLogManager, PlatformActionLogger
+from forecast_runtime import (
+    due_scheduled_events,
+    inject_agent_forecast_memory,
+    record_actions_to_short_memory,
+    select_active_agents_for_round,
+    update_memory_summaries,
+)
 
 try:
-    from camel.models import ModelFactory
-    from camel.types import ModelPlatformType
+    from llm_provider_adapter import create_oasis_model_from_env
     import oasis
     from oasis import (
         ActionType,
@@ -604,7 +610,13 @@ class ParallelIPCHandler:
 def load_config(config_path: str) -> Dict[str, Any]:
     """Load configuration file"""
     with open(config_path, 'r', encoding='utf-8') as f:
-        return json.load(f)
+        config = json.load(f)
+    if config.get("seed") is not None:
+        try:
+            random.seed(int(config["seed"]))
+        except (TypeError, ValueError):
+            random.seed(str(config["seed"]))
+    return config
 
 
 # Non-core action types to be filtered (these actions have low analytical value)
@@ -995,46 +1007,7 @@ def create_model(config: Dict[str, Any], use_boost: bool = False):
         config: Simulation configuration dictionary
         use_boost: Whether to use acceleration LLM configuration (if available)
     """
-    # Check if acceleration configuration exists
-    boost_api_key = os.environ.get("LLM_BOOST_API_KEY", "")
-    boost_base_url = os.environ.get("LLM_BOOST_BASE_URL", "")
-    boost_model = os.environ.get("LLM_BOOST_MODEL_NAME", "")
-    has_boost_config = bool(boost_api_key)
-    
-    # Choose which LLM to use based on parameters and configuration
-    if use_boost and has_boost_config:
-        # Use acceleration configuration
-        llm_api_key = boost_api_key
-        llm_base_url = boost_base_url
-        llm_model = boost_model or os.environ.get("LLM_MODEL_NAME", "")
-        config_label = "[Acceleration LLM]"
-    else:
-        # useCommon configuration
-        llm_api_key = os.environ.get("LLM_API_KEY", "")
-        llm_base_url = os.environ.get("LLM_BASE_URL", "")
-        llm_model = os.environ.get("LLM_MODEL_NAME", "")
-        config_label = "[Common LLM]"
-    
-    # If model name is not in .env, use config as fallback
-    if not llm_model:
-        llm_model = config.get("llm_model", "gpt-4o-mini")
-    
-    # Set environment variables required by camel-ai
-    if llm_api_key:
-        os.environ["OPENAI_API_KEY"] = llm_api_key
-    
-    if not os.environ.get("OPENAI_API_KEY"):
-        raise ValueError("Missing API Key configuration, please set LLM_API_KEY in .env file in project root")
-    
-    if llm_base_url:
-        os.environ["OPENAI_API_BASE_URL"] = llm_base_url
-    
-    print(f"{config_label} model={llm_model}, base_url={llm_base_url[:40] if llm_base_url else 'default'}...")
-    
-    return ModelFactory.create(
-        model_platform=ModelPlatformType.OPENAI,
-        model_type=llm_model,
-    )
+    return create_oasis_model_from_env(config, use_boost=use_boost)
 
 
 def get_active_agents_for_round(
@@ -1044,50 +1017,7 @@ def get_active_agents_for_round(
     round_num: int
 ) -> List:
     """Decide which Agents to activate this round based on time and configuration"""
-    time_config = config.get("time_config", {})
-    agent_configs = config.get("agent_configs", [])
-    
-    base_min = time_config.get("agents_per_hour_min", 5)
-    base_max = time_config.get("agents_per_hour_max", 20)
-    
-    peak_hours = time_config.get("peak_hours", [9, 10, 11, 14, 15, 20, 21, 22])
-    off_peak_hours = time_config.get("off_peak_hours", [0, 1, 2, 3, 4, 5])
-    
-    if current_hour in peak_hours:
-        multiplier = time_config.get("peak_activity_multiplier", 1.5)
-    elif current_hour in off_peak_hours:
-        multiplier = time_config.get("off_peak_activity_multiplier", 0.3)
-    else:
-        multiplier = 1.0
-    
-    target_count = int(random.uniform(base_min, base_max) * multiplier)
-    
-    candidates = []
-    for cfg in agent_configs:
-        agent_id = cfg.get("agent_id", 0)
-        active_hours = cfg.get("active_hours", list(range(8, 23)))
-        activity_level = cfg.get("activity_level", 0.5)
-        
-        if current_hour not in active_hours:
-            continue
-        
-        if random.random() < activity_level:
-            candidates.append(agent_id)
-    
-    selected_ids = random.sample(
-        candidates, 
-        min(target_count, len(candidates))
-    ) if candidates else []
-    
-    active_agents = []
-    for agent_id in selected_ids:
-        try:
-            agent = env.agent_graph.get_agent(agent_id)
-            active_agents.append((agent_id, agent))
-        except Exception:
-            pass
-    
-    return active_agents
+    return select_active_agents_for_round(env, config, current_hour, round_num)
 
 
 class PlatformSimulation:
@@ -1235,6 +1165,34 @@ async def run_twitter_simulation(
         simulated_minutes = round_num * minutes_per_round
         simulated_hour = (simulated_minutes // 60) % 24
         simulated_day = simulated_minutes // (60 * 24) + 1
+
+        event_context = None
+        scheduled_events = due_scheduled_events(config, round_num + 1, simulated_hour, "twitter")
+        if scheduled_events:
+            event_actions = {}
+            for event in scheduled_events:
+                agent_id = event.get("poster_agent_id", 0)
+                content = event.get("content", "")
+                event_context = f"{event.get('title', 'Scheduled event')}: {content}"
+                try:
+                    agent = result.env.agent_graph.get_agent(agent_id)
+                    event_actions[agent] = ManualAction(
+                        action_type=ActionType.CREATE_POST,
+                        action_args={"content": content}
+                    )
+                    if action_logger:
+                        action_logger.log_action(
+                            round_num=round_num + 1,
+                            agent_id=agent_id,
+                            agent_name=agent_names.get(agent_id, f"Agent_{agent_id}"),
+                            action_type="SCHEDULED_EVENT",
+                            action_args={"content": content, "event_type": event.get("event_type"), "title": event.get("title")}
+                        )
+                except Exception:
+                    pass
+            if event_actions:
+                await result.env.step(event_actions)
+                log_info(f"Triggered {len(event_actions)} scheduled forecast events")
         
         active_agents = get_active_agents_for_round(
             result.env, config, simulated_hour, round_num
@@ -1250,6 +1208,11 @@ async def run_twitter_simulation(
                 action_logger.log_round_end(round_num + 1, 0)
             continue
         
+        for agent_id, agent in active_agents:
+            inject_agent_forecast_memory(
+                agent, agent_id, config, simulation_dir, "twitter", round_num + 1, simulated_hour, event_context
+            )
+
         actions = {agent: LLMAction() for _, agent in active_agents}
         await result.env.step(actions)
         
@@ -1257,6 +1220,8 @@ async def run_twitter_simulation(
         actual_actions, last_rowid = fetch_new_actions_from_db(
             db_path, last_rowid, agent_names
         )
+        record_actions_to_short_memory(simulation_dir, "twitter", round_num + 1, actual_actions)
+        update_memory_summaries(simulation_dir, round_num + 1)
         
         round_action_count = 0
         for action_data in actual_actions:
@@ -1434,6 +1399,34 @@ async def run_reddit_simulation(
         simulated_minutes = round_num * minutes_per_round
         simulated_hour = (simulated_minutes // 60) % 24
         simulated_day = simulated_minutes // (60 * 24) + 1
+
+        event_context = None
+        scheduled_events = due_scheduled_events(config, round_num + 1, simulated_hour, "reddit")
+        if scheduled_events:
+            event_actions = {}
+            for event in scheduled_events:
+                agent_id = event.get("poster_agent_id", 0)
+                content = event.get("content", "")
+                event_context = f"{event.get('title', 'Scheduled event')}: {content}"
+                try:
+                    agent = result.env.agent_graph.get_agent(agent_id)
+                    event_actions[agent] = ManualAction(
+                        action_type=ActionType.CREATE_POST,
+                        action_args={"content": content}
+                    )
+                    if action_logger:
+                        action_logger.log_action(
+                            round_num=round_num + 1,
+                            agent_id=agent_id,
+                            agent_name=agent_names.get(agent_id, f"Agent_{agent_id}"),
+                            action_type="SCHEDULED_EVENT",
+                            action_args={"content": content, "event_type": event.get("event_type"), "title": event.get("title")}
+                        )
+                except Exception:
+                    pass
+            if event_actions:
+                await result.env.step(event_actions)
+                log_info(f"Triggered {len(event_actions)} scheduled forecast events")
         
         active_agents = get_active_agents_for_round(
             result.env, config, simulated_hour, round_num
@@ -1449,6 +1442,11 @@ async def run_reddit_simulation(
                 action_logger.log_round_end(round_num + 1, 0)
             continue
         
+        for agent_id, agent in active_agents:
+            inject_agent_forecast_memory(
+                agent, agent_id, config, simulation_dir, "reddit", round_num + 1, simulated_hour, event_context
+            )
+
         actions = {agent: LLMAction() for _, agent in active_agents}
         await result.env.step(actions)
         
@@ -1456,6 +1454,8 @@ async def run_reddit_simulation(
         actual_actions, last_rowid = fetch_new_actions_from_db(
             db_path, last_rowid, agent_names
         )
+        record_actions_to_short_memory(simulation_dir, "reddit", round_num + 1, actual_actions)
+        update_memory_summaries(simulation_dir, round_num + 1)
         
         round_action_count = 0
         for action_data in actual_actions:

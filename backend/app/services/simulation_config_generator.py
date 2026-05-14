@@ -21,6 +21,12 @@ from openai import OpenAI
 from ..config import Config
 from ..utils.logger import get_logger
 from .entity_reader import EntityNode
+from .forecasting import (
+    DEFAULT_HORIZONS,
+    DEFAULT_OUTCOMES,
+    domain_guidance_for_forecast,
+    normalize_forecast_settings,
+)
 
 logger = get_logger('mirofish.simulation_config')
 
@@ -124,6 +130,9 @@ class EventConfig:
     # Opinion narrative direction
     narrative_direction: str = ""
 
+    # Scenario metadata
+    scenario_pack: str = "baseline_adverse_favorable"
+
 
 @dataclass
 class PlatformConfig:
@@ -164,6 +173,14 @@ class SimulationParameters:
     twitter_config: Optional[PlatformConfig] = None
     reddit_config: Optional[PlatformConfig] = None
 
+    # Forecast configuration
+    forecast_mode: str = "general"
+    forecast_horizon: str = "medium_term"
+    prediction_target: Dict[str, Any] = field(default_factory=dict)
+    scenario_pack: str = "baseline_adverse_favorable"
+    ensemble_runs: int = 5
+    memory_mode: str = "practical"
+
     # LLM configuration
     llm_model: str = ""
     llm_base_url: str = ""
@@ -185,6 +202,12 @@ class SimulationParameters:
             "event_config": asdict(self.event_config),
             "twitter_config": asdict(self.twitter_config) if self.twitter_config else None,
             "reddit_config": asdict(self.reddit_config) if self.reddit_config else None,
+            "forecast_mode": self.forecast_mode,
+            "forecast_horizon": self.forecast_horizon,
+            "prediction_target": self.prediction_target,
+            "scenario_pack": self.scenario_pack,
+            "ensemble_runs": self.ensemble_runs,
+            "memory_mode": self.memory_mode,
             "llm_model": self.llm_model,
             "llm_base_url": self.llm_base_url,
             "generated_at": self.generated_at,
@@ -249,6 +272,7 @@ class SimulationConfigGenerator:
         entities: List[EntityNode],
         enable_twitter: bool = True,
         enable_reddit: bool = True,
+        forecast_settings: Optional[Dict[str, Any]] = None,
         progress_callback: Optional[Callable[[int, int, str], None]] = None,
     ) -> SimulationParameters:
         """
@@ -268,7 +292,16 @@ class SimulationConfigGenerator:
         Returns:
             SimulationParameters: Complete simulation parameters
         """
-        logger.info(f"Starting intelligent simulation configuration generation: simulation_id={simulation_id}, entities={len(entities)}")
+        forecast = normalize_forecast_settings(
+            forecast_settings or {},
+            simulation_requirement=simulation_requirement,
+            entity_types=[e.get_entity_type() or "Unknown" for e in entities],
+        )
+        forecast_dict = forecast.to_dict()
+        logger.info(
+            "Starting intelligent simulation configuration generation: "
+            f"simulation_id={simulation_id}, entities={len(entities)}, forecast_mode={forecast.forecast_mode}"
+        )
         
         # Calculate total steps
         num_batches = math.ceil(len(entities) / self.AGENTS_PER_BATCH)
@@ -286,7 +319,8 @@ class SimulationConfigGenerator:
         context = self._build_context(
             simulation_requirement=simulation_requirement,
             document_text=document_text,
-            entities=entities
+            entities=entities,
+            forecast_settings=forecast_dict,
         )
         
         reasoning_parts = []
@@ -294,14 +328,14 @@ class SimulationConfigGenerator:
         # ========== Step 1: Generate time configuration ==========
         report_progress(1, "Generating time configuration...")
         num_entities = len(entities)
-        time_config_result = self._generate_time_config(context, num_entities)
-        time_config = self._parse_time_config(time_config_result, num_entities)
+        time_config_result = self._generate_time_config(context, num_entities, forecast_dict)
+        time_config = self._parse_time_config(time_config_result, num_entities, forecast_dict)
         reasoning_parts.append(f"Time config: {time_config_result.get('reasoning', 'Success')}")
 
         # ========== Step 2: Generate event configuration ==========
         report_progress(2, "Generating event configuration and hot topics...")
-        event_config_result = self._generate_event_config(context, simulation_requirement, entities)
-        event_config = self._parse_event_config(event_config_result)
+        event_config_result = self._generate_event_config(context, simulation_requirement, entities, forecast_dict)
+        event_config = self._parse_event_config(event_config_result, forecast_dict)
         reasoning_parts.append(f"Event config: {event_config_result.get('reasoning', 'Success')}")
 
         # ========== Step 3-N: Generate agent configurations in batches ==========
@@ -320,7 +354,8 @@ class SimulationConfigGenerator:
                 context=context,
                 entities=batch_entities,
                 start_idx=start_idx,
-                simulation_requirement=simulation_requirement
+                simulation_requirement=simulation_requirement,
+                forecast_settings=forecast_dict,
             )
             all_agent_configs.extend(batch_configs)
         
@@ -368,6 +403,12 @@ class SimulationConfigGenerator:
             event_config=event_config,
             twitter_config=twitter_config,
             reddit_config=reddit_config,
+            forecast_mode=forecast.forecast_mode,
+            forecast_horizon=forecast.forecast_horizon,
+            prediction_target=forecast.prediction_target,
+            scenario_pack=forecast.scenario_pack,
+            ensemble_runs=forecast.ensemble_runs,
+            memory_mode=forecast.memory_mode,
             llm_model=self.model_name,
             llm_base_url=self.base_url,
             generation_reasoning=" | ".join(reasoning_parts)
@@ -381,7 +422,8 @@ class SimulationConfigGenerator:
         self,
         simulation_requirement: str,
         document_text: str,
-        entities: List[EntityNode]
+        entities: List[EntityNode],
+        forecast_settings: Optional[Dict[str, Any]] = None,
     ) -> str:
         """Build LLM context, truncate to maximum length"""
 
@@ -391,6 +433,7 @@ class SimulationConfigGenerator:
         # Build context
         context_parts = [
             f"## Simulation Requirements\n{simulation_requirement}",
+            f"\n## Forecast Controls\n{domain_guidance_for_forecast(forecast_settings or {})}",
             f"\n## Entity Information ({len(entities)})\n{entity_summary}",
         ]
 
@@ -531,7 +574,12 @@ class SimulationConfigGenerator:
 
         return None
     
-    def _generate_time_config(self, context: str, num_entities: int) -> Dict[str, Any]:
+    def _generate_time_config(
+        self,
+        context: str,
+        num_entities: int,
+        forecast_settings: Dict[str, Any],
+    ) -> Dict[str, Any]:
         """Generate time configuration"""
         # Use configured context truncation length
         context_truncated = context[:self.TIME_CONFIG_CONTEXT_LENGTH]
@@ -539,6 +587,7 @@ class SimulationConfigGenerator:
         # Calculate maximum allowed value (90% of agents)
         max_agents_allowed = max(1, int(num_entities * 0.9))
 
+        mode = forecast_settings.get("forecast_mode", "general")
         prompt = f"""Based on the following simulation requirements, generate time simulation configuration.
 
 {context_truncated}
@@ -547,16 +596,11 @@ class SimulationConfigGenerator:
 Please generate time configuration JSON.
 
 ### Basic principles (for reference only, adjust flexibly based on event nature and participant characteristics):
-- User base is Chinese people, must follow Beijing Time work schedule habits
-- 0-5am almost no activity (activity coefficient 0.05)
-- 6-8am gradually active (activity coefficient 0.4)
-- 9-18 work time moderately active (activity coefficient 0.7)
-- 19-22 evening is peak period (activity coefficient 1.5)
-- After 23 activity decreases (activity coefficient 0.5)
-- General rule: low activity early morning, gradually increasing morning, moderate work time, evening peak
-- **Important**: Example values below are for reference only, adjust specific time periods based on event nature and participant characteristics
-  - Example: student peak may be 21-23; media active all day; official institutions only during work hours
-  - Example: breaking news may cause late night discussions, off_peak_hours can be shortened appropriately
+- Forecast mode is {mode}; use the schedule that makes the forecast realistic, not a generic Chinese social-media schedule.
+- Legal cases should emphasize court/business hours, filing deadlines, hearing windows, and settlement negotiation cycles.
+- Market/economy cases should emphasize market hours, news release windows, policy announcements, earnings, and after-hours reaction.
+- General public discourse can still use daytime/evening peaks when relevant.
+- Example values below are references only; adjust based on participants and event nature.
 
 ### Return JSON format (no markdown)
 
@@ -584,16 +628,29 @@ Field description:
 - work_hours (int array): Work hours
 - reasoning (string): Brief explanation for this configuration"""
 
-        system_prompt = "You are a social media simulation expert. Return pure JSON format, time configuration must follow Chinese work schedule habits."
+        system_prompt = "You are a probabilistic simulation expert. Return pure JSON format and choose domain-realistic timing."
 
         try:
             return self._call_llm_with_retry(prompt, system_prompt)
         except Exception as e:
             logger.warning(f"Time config LLM generation failed: {e}, using default configuration")
-            return self._get_default_time_config(num_entities)
+            return self._get_default_time_config(num_entities, forecast_settings)
     
-    def _get_default_time_config(self, num_entities: int) -> Dict[str, Any]:
-        """Get default time configuration (Chinese work schedule)"""
+    def _get_default_time_config(self, num_entities: int, forecast_settings: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Get default time configuration for the forecast mode."""
+        mode = (forecast_settings or {}).get("forecast_mode", "general")
+        if mode in {"legal_case", "market_economy"}:
+            return {
+                "total_simulation_hours": 72,
+                "minutes_per_round": 60,
+                "agents_per_hour_min": max(1, num_entities // 20),
+                "agents_per_hour_max": max(4, num_entities // 6),
+                "peak_hours": [9, 10, 11, 14, 15, 16],
+                "off_peak_hours": [0, 1, 2, 3, 4, 5, 22, 23],
+                "morning_hours": [7, 8],
+                "work_hours": [9, 10, 11, 12, 13, 14, 15, 16, 17],
+                "reasoning": f"Using default {mode} forecast schedule (court/market/business-hour weighted)"
+            }
         return {
             "total_simulation_hours": 72,
             "minutes_per_round": 60,  # 1 hour per round, speed up time
@@ -606,11 +663,17 @@ Field description:
             "reasoning": "Using default Chinese work schedule configuration (1 hour per round)"
         }
 
-    def _parse_time_config(self, result: Dict[str, Any], num_entities: int) -> TimeSimulationConfig:
+    def _parse_time_config(
+        self,
+        result: Dict[str, Any],
+        num_entities: int,
+        forecast_settings: Optional[Dict[str, Any]] = None,
+    ) -> TimeSimulationConfig:
         """Parse time configuration result and verify agents_per_hour doesn't exceed total agents"""
+        defaults = self._get_default_time_config(num_entities, forecast_settings)
         # Get original values
-        agents_per_hour_min = result.get("agents_per_hour_min", max(1, num_entities // 15))
-        agents_per_hour_max = result.get("agents_per_hour_max", max(5, num_entities // 5))
+        agents_per_hour_min = result.get("agents_per_hour_min", defaults["agents_per_hour_min"])
+        agents_per_hour_max = result.get("agents_per_hour_max", defaults["agents_per_hour_max"])
 
         # Verify and correct: ensure not exceeding total agents
         if agents_per_hour_min > num_entities:
@@ -627,16 +690,16 @@ Field description:
             logger.warning(f"agents_per_hour_min >= max, corrected to {agents_per_hour_min}")
 
         return TimeSimulationConfig(
-            total_simulation_hours=result.get("total_simulation_hours", 72),
-            minutes_per_round=result.get("minutes_per_round", 60),  # Default 1 hour per round
+            total_simulation_hours=result.get("total_simulation_hours", defaults["total_simulation_hours"]),
+            minutes_per_round=result.get("minutes_per_round", defaults["minutes_per_round"]),
             agents_per_hour_min=agents_per_hour_min,
             agents_per_hour_max=agents_per_hour_max,
-            peak_hours=result.get("peak_hours", [19, 20, 21, 22]),
-            off_peak_hours=result.get("off_peak_hours", [0, 1, 2, 3, 4, 5]),
+            peak_hours=result.get("peak_hours", defaults["peak_hours"]),
+            off_peak_hours=result.get("off_peak_hours", defaults["off_peak_hours"]),
             off_peak_activity_multiplier=0.05,  # Almost no one in early morning
-            morning_hours=result.get("morning_hours", [6, 7, 8]),
+            morning_hours=result.get("morning_hours", defaults["morning_hours"]),
             morning_activity_multiplier=0.4,
-            work_hours=result.get("work_hours", list(range(9, 19))),
+            work_hours=result.get("work_hours", defaults["work_hours"]),
             work_activity_multiplier=0.7,
             peak_activity_multiplier=1.5
         )
@@ -645,7 +708,8 @@ Field description:
         self,
         context: str,
         simulation_requirement: str,
-        entities: List[EntityNode]
+        entities: List[EntityNode],
+        forecast_settings: Dict[str, Any],
     ) -> Dict[str, Any]:
         """Generate event configuration"""
 
@@ -685,9 +749,17 @@ Please generate event configuration JSON:
 - Extract hot topic keywords
 - Describe opinion development direction
 - Design initial post content, **each post must specify poster_type (publisher type)**
+- Design scheduled scenario shocks; each scheduled event must include round, hour, event_type, title, content, poster_type, and expected_effect.
 
 **Important**: poster_type must be selected from the "Available Entity Types" above so initial posts can be assigned to appropriate agents for publishing.
 Example: Official statements should be published by Official/University type, news by MediaOutlet, student opinions by Student type.
+
+Forecast controls:
+{domain_guidance_for_forecast(forecast_settings)}
+
+Domain event guidance:
+- legal_case: use filing deadlines, hearings, discovery disputes, expert reports, settlement offers, injunction decisions, and credibility surprises.
+- market_economy: use CPI, rate decisions, earnings, liquidity shocks, regulatory news, demand shocks, supply-chain events, and market-media reactions.
 
 Return JSON format (no markdown):
 {{
@@ -697,29 +769,76 @@ Return JSON format (no markdown):
         {{"content": "post content", "poster_type": "entity type (must select from available types)"}},
         ...
     ],
+    "scheduled_events": [
+        {{"round": 3, "hour": 10, "event_type": "hearing|filing|rate_decision|earnings|news|shock", "title": "event title", "content": "public event content", "poster_type": "entity type", "expected_effect": "how this changes probabilities"}},
+        ...
+    ],
     "reasoning": "<brief explanation>"
 }}"""
 
-        system_prompt = "You are an opinion analysis expert. Return pure JSON format. Note poster_type must match available entity types precisely."
+        system_prompt = "You are a scenario design expert for probabilistic forecasting. Return pure JSON format. poster_type must match available entity types precisely."
 
         try:
             return self._call_llm_with_retry(prompt, system_prompt)
         except Exception as e:
             logger.warning(f"Event config LLM generation failed: {e}, using default configuration")
-            return {
-                "hot_topics": [],
-                "narrative_direction": "",
-                "initial_posts": [],
-                "reasoning": "Using default configuration"
-            }
+            return self._get_default_event_config(forecast_settings)
 
-    def _parse_event_config(self, result: Dict[str, Any]) -> EventConfig:
+    def _get_default_event_config(self, forecast_settings: Dict[str, Any]) -> Dict[str, Any]:
+        mode = forecast_settings.get("forecast_mode", "general")
+        target = forecast_settings.get("prediction_target", {})
+        if mode == "legal_case":
+            return {
+                "hot_topics": ["evidence strength", "procedural leverage", "settlement posture"],
+                "narrative_direction": "The simulation tests how evidence, procedure, and incentives change legal outcome probabilities.",
+                "initial_posts": [],
+                "scheduled_events": [
+                    {
+                        "round": 3,
+                        "hour": 10,
+                        "event_type": "procedural_update",
+                        "title": "Procedural checkpoint",
+                        "content": "A procedural checkpoint forces agents to reassess evidence strength, settlement leverage, and missing proof.",
+                        "poster_type": "Court",
+                        "expected_effect": "Updates probability ranges around merits and leverage.",
+                    }
+                ],
+                "reasoning": "Using default legal forecast scenario events",
+            }
+        if mode == "market_economy":
+            return {
+                "hot_topics": ["demand signal", "liquidity", "policy shock"],
+                "narrative_direction": "The simulation tests how demand, liquidity, and policy/news shocks change market probabilities.",
+                "initial_posts": [],
+                "scheduled_events": [
+                    {
+                        "round": 3,
+                        "hour": 9,
+                        "event_type": "market_data_release",
+                        "title": "Market data checkpoint",
+                        "content": "A fresh market data checkpoint forces agents to reassess base, upside, and downside cases.",
+                        "poster_type": "Analyst",
+                        "expected_effect": "Updates probability ranges around demand and liquidity.",
+                    }
+                ],
+                "reasoning": "Using default market forecast scenario events",
+            }
+        return {
+            "hot_topics": [],
+            "narrative_direction": "The simulation tests alternative future paths from the uploaded evidence.",
+            "initial_posts": [],
+            "scheduled_events": [],
+            "reasoning": "Using default forecast configuration",
+        }
+
+    def _parse_event_config(self, result: Dict[str, Any], forecast_settings: Dict[str, Any]) -> EventConfig:
         """Parse event configuration result"""
         return EventConfig(
             initial_posts=result.get("initial_posts", []),
-            scheduled_events=[],
+            scheduled_events=result.get("scheduled_events", []),
             hot_topics=result.get("hot_topics", []),
-            narrative_direction=result.get("narrative_direction", "")
+            narrative_direction=result.get("narrative_direction", ""),
+            scenario_pack=forecast_settings.get("scenario_pack", "baseline_adverse_favorable"),
         )
     
     def _assign_initial_post_agents(
@@ -732,7 +851,7 @@ Return JSON format (no markdown):
 
         Match agent_id based on each post's poster_type
         """
-        if not event_config.initial_posts:
+        if not event_config.initial_posts and not event_config.scheduled_events:
             return event_config
 
         # Build agent index by entity type
@@ -753,58 +872,72 @@ Return JSON format (no markdown):
             "alumni": ["alumni", "person"],
             "organization": ["organization", "ngo", "company", "group"],
             "person": ["person", "student", "alumni"],
+            "court": ["court", "judge", "governmentinstitution", "governmentagency", "organization"],
+            "judge": ["judge", "court", "person"],
+            "plaintiff": ["plaintiff", "claimant", "party", "person"],
+            "defendant": ["defendant", "respondent", "party", "person"],
+            "counsel": ["counsel", "lawyer", "attorney", "person"],
+            "attorney": ["attorney", "lawyer", "counsel", "person"],
+            "lawyer": ["lawyer", "attorney", "counsel", "person"],
+            "analyst": ["analyst", "expert", "person", "mediaoutlet"],
+            "investor": ["investor", "trader", "fund", "person", "organization"],
+            "regulator": ["regulator", "governmentagency", "government", "organization"],
         }
 
         # Track used agent indices for each type to avoid reusing same agent
         used_indices: Dict[str, int] = {}
 
-        updated_posts = []
-        for post in event_config.initial_posts:
-            poster_type = post.get("poster_type", "").lower()
-            content = post.get("content", "")
+        def assign_posts(posts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+            updated_posts = []
+            for post in posts:
+                poster_type = post.get("poster_type", "").lower()
+                content = post.get("content", "")
 
-            # Try to find matching agent
-            matched_agent_id = None
+                # Try to find matching agent
+                matched_agent_id = None
 
-            # 1. Direct match
-            if poster_type in agents_by_type:
-                agents = agents_by_type[poster_type]
-                idx = used_indices.get(poster_type, 0) % len(agents)
-                matched_agent_id = agents[idx].agent_id
-                used_indices[poster_type] = idx + 1
-            else:
-                # 2. Match using aliases
-                for alias_key, aliases in type_aliases.items():
-                    if poster_type in aliases or alias_key == poster_type:
-                        for alias in aliases:
-                            if alias in agents_by_type:
-                                agents = agents_by_type[alias]
-                                idx = used_indices.get(alias, 0) % len(agents)
-                                matched_agent_id = agents[idx].agent_id
-                                used_indices[alias] = idx + 1
-                                break
-                    if matched_agent_id is not None:
-                        break
-
-            # 3. If still not found, use agent with highest influence
-            if matched_agent_id is None:
-                logger.warning(f"No matching agent found for type '{poster_type}', using agent with highest influence")
-                if agent_configs:
-                    # Sort by influence, select highest
-                    sorted_agents = sorted(agent_configs, key=lambda a: a.influence_weight, reverse=True)
-                    matched_agent_id = sorted_agents[0].agent_id
+                # 1. Direct match
+                if poster_type in agents_by_type:
+                    agents = agents_by_type[poster_type]
+                    idx = used_indices.get(poster_type, 0) % len(agents)
+                    matched_agent_id = agents[idx].agent_id
+                    used_indices[poster_type] = idx + 1
                 else:
-                    matched_agent_id = 0
+                    # 2. Match using aliases
+                    for alias_key, aliases in type_aliases.items():
+                        if poster_type in aliases or alias_key == poster_type:
+                            for alias in aliases:
+                                if alias in agents_by_type:
+                                    agents = agents_by_type[alias]
+                                    idx = used_indices.get(alias, 0) % len(agents)
+                                    matched_agent_id = agents[idx].agent_id
+                                    used_indices[alias] = idx + 1
+                                    break
+                        if matched_agent_id is not None:
+                            break
 
-            updated_posts.append({
-                "content": content,
-                "poster_type": post.get("poster_type", "Unknown"),
-                "poster_agent_id": matched_agent_id
-            })
+                # 3. If still not found, use agent with highest influence
+                if matched_agent_id is None:
+                    logger.warning(f"No matching agent found for type '{poster_type}', using agent with highest influence")
+                    if agent_configs:
+                        # Sort by influence, select highest
+                        sorted_agents = sorted(agent_configs, key=lambda a: a.influence_weight, reverse=True)
+                        matched_agent_id = sorted_agents[0].agent_id
+                    else:
+                        matched_agent_id = 0
 
-            logger.info(f"Initial post assigned: poster_type='{poster_type}' -> agent_id={matched_agent_id}")
+                updated = dict(post)
+                updated["content"] = content
+                updated["poster_type"] = post.get("poster_type", "Unknown")
+                updated["poster_agent_id"] = matched_agent_id
+                updated_posts.append(updated)
 
-        event_config.initial_posts = updated_posts
+                logger.info(f"Post assigned: poster_type='{poster_type}' -> agent_id={matched_agent_id}")
+
+            return updated_posts
+
+        event_config.initial_posts = assign_posts(event_config.initial_posts)
+        event_config.scheduled_events = assign_posts(event_config.scheduled_events)
         return event_config
     
     def _generate_agent_configs_batch(
@@ -812,7 +945,8 @@ Return JSON format (no markdown):
         context: str,
         entities: List[EntityNode],
         start_idx: int,
-        simulation_requirement: str
+        simulation_requirement: str,
+        forecast_settings: Dict[str, Any],
     ) -> List[AgentActivityConfig]:
         """Generate agent configurations in batch"""
 
@@ -827,9 +961,12 @@ Return JSON format (no markdown):
                 "summary": e.summary[:summary_len] if e.summary else ""
             })
 
-        prompt = f"""Based on the following information, generate social media activity configuration for each entity.
+        prompt = f"""Based on the following information, generate forecast simulation activity configuration for each entity.
 
 Simulation Requirements: {simulation_requirement}
+
+Forecast Controls:
+{domain_guidance_for_forecast(forecast_settings)}
 
 ## Entity List
 ```json
@@ -838,11 +975,11 @@ Simulation Requirements: {simulation_requirement}
 
 ## Task
 Generate activity configuration for each entity, noting:
-- **Time follows Chinese work schedule**: Almost no activity 0-5am, most active 19-22
-- **Official institutions** (University/GovernmentAgency): Low activity (0.1-0.3), active during work hours (9-17), slow response (60-240 min), high influence (2.5-3.0)
-- **Media** (MediaOutlet): Medium activity (0.4-0.6), active all day (8-23), fast response (5-30 min), high influence (2.0-2.5)
-- **Individuals** (Student/Person/Alumni): High activity (0.6-0.9), mainly evening activity (18-23), fast response (1-15 min), low influence (0.8-1.2)
-- **Public figures/Experts**: Medium activity (0.4-0.6), medium-high influence (1.5-2.0)
+- Use domain-realistic timing and roles, not generic public-chat behavior.
+- Legal mode: courts/counsel/regulators are lower-frequency but high influence; parties and witnesses react around procedural events; settlement actors respond after delay.
+- Market mode: policy actors and companies are lower-frequency/high-influence; analysts/media/traders react quickly; consumers/supply actors reveal demand signals.
+- posts_per_hour and comments_per_hour should represent expected forecast-relevant actions, not generic chatter.
+- stance must reflect role-specific forecast posture toward the prediction target.
 
 Return JSON format (no markdown):
 {{
@@ -863,7 +1000,7 @@ Return JSON format (no markdown):
     ]
 }}"""
 
-        system_prompt = "You are a social media behavior analysis expert. Return pure JSON, configuration must follow Chinese work schedule habits."
+        system_prompt = "You are a forecast-agent behavior analysis expert. Return pure JSON with domain-realistic settings."
 
         try:
             result = self._call_llm_with_retry(prompt, system_prompt)
@@ -880,7 +1017,7 @@ Return JSON format (no markdown):
 
             # If LLM didn't generate, use rule-based generation
             if not cfg:
-                cfg = self._generate_agent_config_by_rule(entity)
+                cfg = self._generate_agent_config_by_rule(entity, forecast_settings)
 
             config = AgentActivityConfig(
                 agent_id=agent_id,
@@ -901,9 +1038,28 @@ Return JSON format (no markdown):
 
         return configs
     
-    def _generate_agent_config_by_rule(self, entity: EntityNode) -> Dict[str, Any]:
-        """Generate single agent configuration based on rules (Chinese work schedule)"""
+    def _generate_agent_config_by_rule(self, entity: EntityNode, forecast_settings: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Generate single agent configuration based on rules."""
         entity_type = (entity.get_entity_type() or "Unknown").lower()
+        mode = (forecast_settings or {}).get("forecast_mode", "general")
+
+        if mode == "legal_case":
+            if any(term in entity_type for term in ["court", "judge"]):
+                return {"activity_level": 0.25, "posts_per_hour": 0.05, "comments_per_hour": 0.05, "active_hours": list(range(9, 17)), "response_delay_min": 120, "response_delay_max": 480, "sentiment_bias": 0.0, "stance": "neutral_decision_maker", "influence_weight": 3.0}
+            if any(term in entity_type for term in ["plaintiff", "defendant", "claimant", "respondent", "party"]):
+                return {"activity_level": 0.55, "posts_per_hour": 0.25, "comments_per_hour": 0.5, "active_hours": list(range(8, 21)), "response_delay_min": 30, "response_delay_max": 180, "sentiment_bias": 0.0, "stance": "self_interested", "influence_weight": 1.5}
+            if any(term in entity_type for term in ["lawyer", "attorney", "counsel"]):
+                return {"activity_level": 0.5, "posts_per_hour": 0.2, "comments_per_hour": 0.6, "active_hours": list(range(7, 20)), "response_delay_min": 15, "response_delay_max": 120, "sentiment_bias": 0.0, "stance": "strategic_advocate", "influence_weight": 2.2}
+            if any(term in entity_type for term in ["expert", "witness"]):
+                return {"activity_level": 0.35, "posts_per_hour": 0.15, "comments_per_hour": 0.35, "active_hours": list(range(9, 18)), "response_delay_min": 60, "response_delay_max": 240, "sentiment_bias": 0.0, "stance": "evidence_weighted", "influence_weight": 1.8}
+
+        if mode == "market_economy":
+            if any(term in entity_type for term in ["bank", "central", "regulator", "government"]):
+                return {"activity_level": 0.25, "posts_per_hour": 0.1, "comments_per_hour": 0.05, "active_hours": list(range(8, 18)), "response_delay_min": 60, "response_delay_max": 240, "sentiment_bias": 0.0, "stance": "policy_guarded", "influence_weight": 3.0}
+            if any(term in entity_type for term in ["analyst", "media", "journalist"]):
+                return {"activity_level": 0.65, "posts_per_hour": 0.6, "comments_per_hour": 0.8, "active_hours": list(range(6, 23)), "response_delay_min": 5, "response_delay_max": 45, "sentiment_bias": 0.0, "stance": "signal_interpreter", "influence_weight": 2.2}
+            if any(term in entity_type for term in ["investor", "trader", "fund"]):
+                return {"activity_level": 0.8, "posts_per_hour": 0.5, "comments_per_hour": 1.2, "active_hours": list(range(7, 22)), "response_delay_min": 1, "response_delay_max": 20, "sentiment_bias": 0.0, "stance": "risk_adjusting", "influence_weight": 1.7}
 
         if entity_type in ["university", "governmentagency", "ngo"]:
             # Official institutions: work hour activity, low frequency, high influence

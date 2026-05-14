@@ -22,6 +22,7 @@ from neo4j.exceptions import (
 from ..config import Config
 from .graph_storage import GraphStorage
 from .embedding_service import EmbeddingError, EmbeddingService
+from .extraction_cache import ExtractionCache
 from .ner_extractor import NERExtractor
 from .search_service import SearchService
 from . import neo4j_schema
@@ -52,6 +53,9 @@ class Neo4jStorage(GraphStorage):
         )
         self._embedding = embedding_service or EmbeddingService()
         self._ner = ner_extractor or NERExtractor()
+        self._extraction_cache = (
+            ExtractionCache() if Config.GRAPH_EXTRACTION_CACHE_ENABLED else None
+        )
         self._search = SearchService(self._embedding)
 
         # Initialize schema (indexes, constraints)
@@ -608,28 +612,37 @@ class Neo4jStorage(GraphStorage):
     def add_text(self, graph_id: str, text: str) -> str:
         """Process text: NER/RE → batch embed → create nodes/edges → return episode_id."""
         self._assert_embedding_compatible(graph_id)
+        ontology = self.get_ontology(graph_id)
+
+        logger.info(f"[add_text] Starting NER extraction for chunk ({len(text)} chars)...")
+        extraction = self._ner.extract(text, ontology)
+        logger.info(
+            "[add_text] NER done: %s entities, %s relations",
+            len(extraction.get("entities", [])),
+            len(extraction.get("relations", [])),
+        )
+        return self._write_extraction(graph_id, text, extraction)
+
+    def _write_extraction(
+        self,
+        graph_id: str,
+        text: str,
+        extraction: Dict[str, Any],
+        profile: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """Write a precomputed extraction to Neo4j and return the episode id."""
         episode_id = str(uuid.uuid4())
         now = datetime.now(timezone.utc).isoformat()
 
-        # Get ontology for NER guidance
-        ontology = self.get_ontology(graph_id)
-
-        # Extract entities and relations
-        logger.info(f"[add_text] Starting NER extraction for chunk ({len(text)} chars)...")
-        extraction = self._ner.extract(text, ontology)
         entities = extraction.get("entities", [])
         relations = extraction.get("relations", [])
 
-        logger.info(
-            f"[add_text] NER done: {len(entities)} entities, {len(relations)} relations"
-        )
-
-        # --- Batch embed all texts at once ---
         entity_summaries = [f"{e['name']} ({e['type']})" for e in entities]
         fact_texts = [r.get("fact", f"{r['source']} {r['type']} {r['target']}") for r in relations]
         all_texts_to_embed = entity_summaries + fact_texts
 
         all_embeddings: list = []
+        embedding_start = time.perf_counter()
         if all_texts_to_embed:
             logger.info(f"[add_text] Batch-embedding {len(all_texts_to_embed)} texts...")
             try:
@@ -639,13 +652,17 @@ class Neo4jStorage(GraphStorage):
                     "Batch embedding failed. Graph build stopped to avoid storing empty vectors. "
                     f"Provider={self._embedding.provider_id()} Error={e}"
                 ) from e
+        if profile is not None:
+            profile["embedding_seconds"] = profile.get("embedding_seconds", 0.0) + (
+                time.perf_counter() - embedding_start
+            )
 
         entity_embeddings = all_embeddings[:len(entities)]
         relation_embeddings = all_embeddings[len(entities):]
-        logger.info(f"[add_text] Embedding done, writing to Neo4j...")
+        logger.info("[add_text] Embedding done, writing to Neo4j...")
 
+        write_start = time.perf_counter()
         with self._driver.session() as session:
-            # Create episode node
             def _create_episode(tx):
                 tx.run(
                     """
@@ -665,8 +682,7 @@ class Neo4jStorage(GraphStorage):
 
             self._call_with_retry(session.execute_write, _create_episode)
 
-            # MERGE entities (upsert by graph_id + name + primary label)
-            entity_uuid_map: Dict[str, str] = {}  # name_lower -> uuid
+            entity_uuid_map: Dict[str, str] = {}
             for idx, entity in enumerate(entities):
                 ename = entity["name"]
                 etype = entity["type"]
@@ -680,7 +696,6 @@ class Neo4jStorage(GraphStorage):
                 def _merge_entity(tx, _uuid=e_uuid, _name=ename, _type=etype,
                                   _attrs=attrs, _embedding=embedding,
                                   _summary=summary_text, _now=now):
-                    # MERGE by graph_id + lowercase name to deduplicate
                     result = tx.run(
                         """
                         MERGE (n:Entity {graph_id: $gid, name_lower: $name_lower})
@@ -713,7 +728,6 @@ class Neo4jStorage(GraphStorage):
                 actual_uuid = self._call_with_retry(session.execute_write, _merge_entity)
                 entity_uuid_map[ename.lower()] = actual_uuid
 
-                # Add entity type label
                 if etype and etype != "Entity":
                     try:
                         def _add_label(tx, _name_lower=ename.lower()):
@@ -726,7 +740,6 @@ class Neo4jStorage(GraphStorage):
                     except Exception as e:
                         logger.warning(f"Failed to add label '{etype}' to '{ename}': {e}")
 
-            # Create relations
             for idx, relation in enumerate(relations):
                 source_name = relation["source"]
                 target_name = relation["target"]
@@ -738,8 +751,9 @@ class Neo4jStorage(GraphStorage):
 
                 if not source_uuid or not target_uuid:
                     logger.warning(
-                        f"Skipping relation {source_name}->{target_name}: "
-                        f"entity not found in extraction results"
+                        "Skipping relation %s->%s: entity not found in extraction results",
+                        source_name,
+                        target_name,
                     )
                     continue
 
@@ -780,6 +794,10 @@ class Neo4jStorage(GraphStorage):
                     )
 
                 self._call_with_retry(session.execute_write, _create_relation)
+        if profile is not None:
+            profile["neo4j_write_seconds"] = profile.get("neo4j_write_seconds", 0.0) + (
+                time.perf_counter() - write_start
+            )
 
         logger.info(f"[add_text] Chunk done: episode={episode_id}")
         return episode_id
@@ -790,15 +808,69 @@ class Neo4jStorage(GraphStorage):
         chunks: List[str],
         batch_size: int = 3,
         progress_callback: Optional[Callable] = None,
+        cache_context: Optional[Dict[str, Any]] = None,
+        profile_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> List[str]:
-        """Batch-add text chunks with progress reporting."""
+        """Batch-add text chunks with cached batched NER extraction."""
+        batch_started = time.perf_counter()
+        profile: Dict[str, Any] = {
+            "llm_extraction_seconds": 0.0,
+            "embedding_seconds": 0.0,
+            "neo4j_write_seconds": 0.0,
+            "cache_hits": 0,
+            "cache_misses": 0,
+        }
+        self._assert_embedding_compatible(graph_id)
+        ontology = self.get_ontology(graph_id)
+        ontology_hash = (cache_context or {}).get("ontology_hash") or ExtractionCache.hash_ontology(ontology)
+        file_hash = (cache_context or {}).get("file_hash") or ExtractionCache.hash_text("\n".join(chunks))
+
         episode_ids = []
-        total = len(chunks)
+        total = len(chunks) or 1
+        extractions: Dict[int, Dict[str, Any]] = {}
+        missing: List[tuple[int, str, str]] = []
+
+        for idx, chunk in enumerate(chunks):
+            if not chunk or not chunk.strip():
+                extractions[idx] = {"entities": [], "relations": []}
+                continue
+            chunk_hash = ExtractionCache.hash_text(chunk)
+            cached = (
+                self._extraction_cache.get(file_hash, chunk_hash, ontology_hash)
+                if self._extraction_cache
+                else None
+            )
+            if cached is not None:
+                logger.info("[add_text_batch] NER cache hit for chunk %s/%s", idx + 1, len(chunks))
+                extractions[idx] = cached
+                profile["cache_hits"] += 1
+            else:
+                profile["cache_misses"] += 1
+                missing.append((idx, chunk, chunk_hash))
+
+        if missing:
+            logger.info(
+                "[add_text_batch] Batch NER for %s uncached chunks (%s cache hits)",
+                len(missing),
+                len(chunks) - len(missing),
+            )
+            miss_chunks = [chunk for _, chunk, _ in missing]
+            llm_started = time.perf_counter()
+            if hasattr(self._ner, "extract_batch"):
+                miss_extractions = self._ner.extract_batch(miss_chunks, ontology)
+            else:
+                miss_extractions = [self._ner.extract(chunk, ontology) for chunk in miss_chunks]
+            profile["llm_extraction_seconds"] += time.perf_counter() - llm_started
+
+            for (idx, _chunk, chunk_hash), extraction in zip(missing, miss_extractions):
+                extractions[idx] = extraction
+                if self._extraction_cache:
+                    self._extraction_cache.set(file_hash, chunk_hash, ontology_hash, extraction)
 
         for i, chunk in enumerate(chunks):
             if not chunk or not chunk.strip():
                 continue
-            episode_id = self.add_text(graph_id, chunk)
+            episode_id = self._write_extraction(graph_id, chunk, extractions[i], profile=profile)
             episode_ids.append(episode_id)
 
             if progress_callback:
@@ -807,7 +879,81 @@ class Neo4jStorage(GraphStorage):
 
             logger.info(f"Processed chunk {i + 1}/{total}")
 
+        profile["total_seconds"] = time.perf_counter() - batch_started
+        for key, value in list(profile.items()):
+            if isinstance(value, float):
+                profile[key] = round(value, 4)
+        if profile_callback:
+            profile_callback(profile)
+
         return episode_ids
+
+    def add_agent_memories(self, graph_id: str, memories: List[Dict[str, Any]]) -> List[str]:
+        """Write forecast/simulation memories as searchable Neo4j Entity nodes."""
+        clean_memories = [
+            memory for memory in memories
+            if memory.get("text") and str(memory.get("text")).strip()
+        ]
+        if not clean_memories:
+            return []
+
+        texts = [str(memory["text"])[:2000] for memory in clean_memories]
+        embeddings = self._embedding.embed_batch(texts)
+        now = datetime.now(timezone.utc).isoformat()
+        rows = []
+        for memory, text, embedding in zip(clean_memories, texts, embeddings):
+            memory_uuid = str(uuid.uuid4())
+            attrs = {
+                "agent_id": memory.get("agent_id"),
+                "agent_name": memory.get("agent_name"),
+                "platform": memory.get("platform"),
+                "action_type": memory.get("action_type"),
+                "round_num": memory.get("round_num"),
+                "importance": memory.get("importance", 0.25),
+                "recency": memory.get("recency") or memory.get("timestamp") or now,
+                "source": memory.get("source", "simulation"),
+                "visibility": memory.get("visibility", "public"),
+            }
+            rows.append({
+                "uuid": memory_uuid,
+                "name": f"Memory: {attrs.get('agent_name') or attrs.get('agent_id')} {attrs.get('action_type')}",
+                "summary": text,
+                "embedding": embedding,
+                "attrs_json": json.dumps(attrs, ensure_ascii=False),
+                "importance": attrs["importance"],
+                "recency": attrs["recency"],
+                "source": attrs["source"],
+                "visibility": attrs["visibility"],
+                "created_at": now,
+            })
+
+        def _write(tx):
+            tx.run(
+                """
+                UNWIND $rows AS row
+                CREATE (m:Entity:AgentMemory {
+                    uuid: row.uuid,
+                    graph_id: $gid,
+                    name: row.name,
+                    summary: row.summary,
+                    embedding: row.embedding,
+                    attributes_json: row.attrs_json,
+                    importance: row.importance,
+                    recency: row.recency,
+                    source: row.source,
+                    visibility: row.visibility,
+                    created_at: row.created_at
+                })
+                """,
+                gid=graph_id,
+                rows=rows,
+            )
+
+        with self._driver.session() as session:
+            self._call_with_retry(session.execute_write, _write)
+
+        logger.info("[agent_memory] Wrote %s memory records to graph %s", len(rows), graph_id)
+        return [row["uuid"] for row in rows]
 
     def wait_for_processing(
         self,

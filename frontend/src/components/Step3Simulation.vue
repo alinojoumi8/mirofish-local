@@ -396,7 +396,10 @@ const doStartSimulation = async () => {
       simulation_id: props.simulationId,
       platform: 'parallel',
       force: true,  // Force restart
-      enable_graph_memory_update: true  // Enable dynamic graph update
+      enable_graph_memory_update: true,  // Enable dynamic graph update
+      scenario_id: 'baseline',
+      seed: Date.now() % 1000000,
+      memory_mode: 'practical'
     }
 
     if (props.maxRounds) {
@@ -655,7 +658,8 @@ const handleNextStep = async () => {
   try {
     const res = await generateReport({
       simulation_id: props.simulationId,
-      force_regenerate: true
+      force_regenerate: true,
+      strict_antirepetition: true
     })
 
     if (res.success && res.data) {

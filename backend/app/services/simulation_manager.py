@@ -17,6 +17,7 @@ from ..utils.logger import get_logger
 from .entity_reader import EntityReader, FilteredEntities
 from .oasis_profile_generator import OasisProfileGenerator, OasisAgentProfile
 from .simulation_config_generator import SimulationConfigGenerator, SimulationParameters
+from .forecasting import ForecastSettings, normalize_forecast_settings
 
 logger = get_logger('mirofish.simulation')
 
@@ -73,6 +74,14 @@ class SimulationState:
     
     # Error message
     error: Optional[str] = None
+
+    # Forecast configuration
+    forecast_mode: str = "general"
+    forecast_horizon: str = "medium_term"
+    prediction_target: Dict[str, Any] = field(default_factory=dict)
+    scenario_pack: str = "baseline_adverse_favorable"
+    ensemble_runs: int = 5
+    memory_mode: str = "practical"
     
     def to_dict(self) -> Dict[str, Any]:
         """Complete status dict (internal use)"""
@@ -94,6 +103,12 @@ class SimulationState:
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "error": self.error,
+            "forecast_mode": self.forecast_mode,
+            "forecast_horizon": self.forecast_horizon,
+            "prediction_target": self.prediction_target,
+            "scenario_pack": self.scenario_pack,
+            "ensemble_runs": self.ensemble_runs,
+            "memory_mode": self.memory_mode,
         }
     
     def to_simple_dict(self) -> Dict[str, Any]:
@@ -108,6 +123,12 @@ class SimulationState:
             "entity_types": self.entity_types,
             "config_generated": self.config_generated,
             "error": self.error,
+            "forecast_mode": self.forecast_mode,
+            "forecast_horizon": self.forecast_horizon,
+            "prediction_target": self.prediction_target,
+            "scenario_pack": self.scenario_pack,
+            "ensemble_runs": self.ensemble_runs,
+            "memory_mode": self.memory_mode,
         }
 
 
@@ -185,6 +206,12 @@ class SimulationManager:
             created_at=data.get("created_at", datetime.now().isoformat()),
             updated_at=data.get("updated_at", datetime.now().isoformat()),
             error=data.get("error"),
+            forecast_mode=data.get("forecast_mode", "general"),
+            forecast_horizon=data.get("forecast_horizon", "medium_term"),
+            prediction_target=data.get("prediction_target", {}),
+            scenario_pack=data.get("scenario_pack", "baseline_adverse_favorable"),
+            ensemble_runs=data.get("ensemble_runs", 5),
+            memory_mode=data.get("memory_mode", "practical"),
         )
         
         self._simulations[simulation_id] = state
@@ -236,6 +263,7 @@ class SimulationManager:
         progress_callback: Optional[callable] = None,
         parallel_profile_count: int = 3,
         storage: 'GraphStorage' = None,
+        forecast_settings: Optional[ForecastSettings] = None,
     ) -> SimulationState:
         """
         Prepare simulation environment (fully automated)
@@ -265,6 +293,18 @@ class SimulationManager:
         
         try:
             state.status = SimulationStatus.PREPARING
+            if forecast_settings is None:
+                forecast_settings = normalize_forecast_settings(
+                    {},
+                    simulation_requirement=simulation_requirement,
+                    entity_types=state.entity_types,
+                )
+            state.forecast_mode = forecast_settings.forecast_mode
+            state.forecast_horizon = forecast_settings.forecast_horizon
+            state.prediction_target = forecast_settings.prediction_target
+            state.scenario_pack = forecast_settings.scenario_pack
+            state.ensemble_runs = forecast_settings.ensemble_runs
+            state.memory_mode = forecast_settings.memory_mode
             self._save_simulation_state(state)
             
             sim_dir = self._get_simulation_dir(simulation_id)
@@ -315,7 +355,11 @@ class SimulationManager:
                 )
             
             # Pass graph_id to enable graph retrieval functionality, get richer context
-            generator = OasisProfileGenerator(storage=storage, graph_id=state.graph_id)
+            generator = OasisProfileGenerator(
+                storage=storage,
+                graph_id=state.graph_id,
+                forecast_settings=forecast_settings.to_dict(),
+            )
             
             def profile_progress(current, total, msg):
                 if progress_callback:
@@ -410,7 +454,8 @@ class SimulationManager:
                 document_text=document_text,
                 entities=filtered.entities,
                 enable_twitter=state.enable_twitter,
-                enable_reddit=state.enable_reddit
+                enable_reddit=state.enable_reddit,
+                forecast_settings=forecast_settings.to_dict(),
             )
             
             if progress_callback:

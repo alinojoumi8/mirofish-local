@@ -6,6 +6,7 @@ Uses LLMClient.chat_json() with a structured prompt to extract
 entities and relations from text chunks, guided by the graph's ontology.
 """
 
+import json
 import logging
 from typing import Dict, Any, List, Optional
 
@@ -41,6 +42,28 @@ Return ONLY valid JSON in this exact format:
 _USER_PROMPT = """Extract entities and relations from the following text:
 
 {text}"""
+
+_BATCH_USER_PROMPT = """Extract entities and relations from each input chunk.
+
+Return ONLY valid JSON in this exact format:
+{{
+  "chunks": [
+    {{
+      "chunk_index": 0,
+      "entities": [
+        {{"name": "...", "type": "...", "attributes": {{"key": "value"}}}}
+      ],
+      "relations": [
+        {{"source": "...", "target": "...", "type": "...", "fact": "..."}}
+      ]
+    }}
+  ]
+}}
+
+Each result's chunk_index must match the input chunk_index. Do not merge entities across chunks.
+
+INPUT_CHUNKS:
+{chunks_json}"""
 
 
 class NERExtractor:
@@ -102,6 +125,76 @@ class NERExtractor:
             f"NER extraction failed after {self.max_retries + 1} attempts: {last_error}"
         )
         return {"entities": [], "relations": []}
+
+    def extract_batch(self, chunks: List[str], ontology: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """
+        Extract entities and relations for multiple chunks in one LLM request.
+
+        The return list always has the same length and order as ``chunks``.
+        Missing or invalid per-chunk outputs fall back to single-chunk extraction
+        so graph builds keep working even when a provider ignores the batch schema.
+        """
+        results = [{"entities": [], "relations": []} for _ in chunks]
+        indexed_chunks = [
+            {"chunk_index": idx, "text": chunk.strip()}
+            for idx, chunk in enumerate(chunks)
+            if chunk and chunk.strip()
+        ]
+        if not indexed_chunks:
+            return results
+
+        ontology_desc = self._format_ontology(ontology)
+        system_msg = _SYSTEM_PROMPT.format(ontology_description=ontology_desc)
+        user_msg = _BATCH_USER_PROMPT.format(
+            chunks_json=json.dumps(indexed_chunks, ensure_ascii=False)
+        )
+        messages = [
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": user_msg},
+        ]
+
+        try:
+            payload = self.llm.chat_json(
+                messages=messages,
+                temperature=0.1,
+                max_tokens=8192,
+            )
+            chunk_payloads = payload.get("chunks", [])
+            if not isinstance(chunk_payloads, list):
+                raise ValueError("Batch NER response missing chunks list")
+
+            seen_indexes = set()
+            for position, item in enumerate(chunk_payloads):
+                if not isinstance(item, dict):
+                    continue
+                raw_index = item.get("chunk_index", item.get("index", position))
+                try:
+                    chunk_index = int(raw_index)
+                except (TypeError, ValueError):
+                    continue
+                if 0 <= chunk_index < len(results):
+                    results[chunk_index] = self._validate_and_clean(item, ontology)
+                    seen_indexes.add(chunk_index)
+
+            missing = [
+                item for item in indexed_chunks
+                if item["chunk_index"] not in seen_indexes
+            ]
+            if missing:
+                logger.warning(
+                    "Batch NER omitted %s/%s chunks; falling back for missing chunks",
+                    len(missing),
+                    len(indexed_chunks),
+                )
+                for item in missing:
+                    results[item["chunk_index"]] = self.extract(item["text"], ontology)
+            return results
+
+        except Exception as exc:
+            logger.warning("Batch NER extraction failed; falling back to per-chunk extraction: %s", exc)
+            for item in indexed_chunks:
+                results[item["chunk_index"]] = self.extract(item["text"], ontology)
+            return results
 
     def _format_ontology(self, ontology: Dict[str, Any]) -> str:
         """Format ontology dict into readable text for the LLM prompt."""

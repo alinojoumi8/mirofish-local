@@ -13,6 +13,7 @@ from ..services.entity_reader import EntityReader
 from ..services.oasis_profile_generator import OasisProfileGenerator
 from ..services.simulation_manager import SimulationManager, SimulationStatus
 from ..services.simulation_runner import SimulationRunner, RunnerStatus
+from ..services.forecasting import normalize_forecast_settings
 from ..utils.logger import get_logger
 from ..models.project import ProjectManager
 
@@ -457,6 +458,14 @@ def prepare_simulation():
         entity_types_list = data.get('entity_types')
         use_llm_for_profiles = data.get('use_llm_for_profiles', True)
         parallel_profile_count = data.get('parallel_profile_count', 5)
+        raw_forecast_settings = {
+            "forecast_mode": data.get("forecast_mode"),
+            "forecast_horizon": data.get("forecast_horizon"),
+            "prediction_target": data.get("prediction_target"),
+            "scenario_pack": data.get("scenario_pack"),
+            "ensemble_runs": data.get("ensemble_runs"),
+            "memory_mode": data.get("memory_mode"),
+        }
         
         # ========== Get GraphStorage（Capture reference before background task starts） ==========
         storage = current_app.extensions.get('neo4j_storage')
@@ -478,9 +487,26 @@ def prepare_simulation():
             state.entities_count = filtered_preview.filtered_count
             state.entity_types = list(filtered_preview.entity_types)
             logger.info(f"Expected entity count: {filtered_preview.filtered_count}, [type][model]: {filtered_preview.entity_types}")
+            forecast_settings = normalize_forecast_settings(
+                raw_forecast_settings,
+                simulation_requirement=simulation_requirement,
+                entity_types=filtered_preview.entity_types,
+            )
         except Exception as e:
             logger.warning(f"Synchronously get entity countFailed（Will retry in background task）: {e}")
             # Failure does not affect subsequent process，Background task will retry
+            forecast_settings = normalize_forecast_settings(
+                raw_forecast_settings,
+                simulation_requirement=simulation_requirement,
+                entity_types=entity_types_list,
+            )
+
+        state.forecast_mode = forecast_settings.forecast_mode
+        state.forecast_horizon = forecast_settings.forecast_horizon
+        state.prediction_target = forecast_settings.prediction_target
+        state.scenario_pack = forecast_settings.scenario_pack
+        state.ensemble_runs = forecast_settings.ensemble_runs
+        state.memory_mode = forecast_settings.memory_mode
         
         # Create async task
         task_manager = TaskManager()
@@ -580,6 +606,7 @@ def prepare_simulation():
                     progress_callback=progress_callback,
                     parallel_profile_count=parallel_profile_count,
                     storage=storage,
+                    forecast_settings=forecast_settings,
                 )
                 
                 # Task complete
@@ -612,7 +639,8 @@ def prepare_simulation():
                 "message": "Preparation task started，Please via /api/simulation/prepare/status Query progress",
                 "already_prepared": False,
                 "expected_entities_count": state.entities_count,  # Expected number of entities to process
-                "entity_types": state.entity_types  # Entity type list
+                "entity_types": state.entity_types,  # Entity type list
+                "forecast_settings": forecast_settings.to_dict(),
             }
         })
         
@@ -1498,6 +1526,9 @@ def start_simulation():
         max_rounds = data.get('max_rounds')  # Optional: Maximum simulation rounds
         enable_graph_memory_update = data.get('enable_graph_memory_update', False)  # Optional：IsFalseEnable knowledge graph memory update
         force = data.get('force', False)  # Optional：Force restart
+        scenario_id = data.get('scenario_id')
+        seed = data.get('seed')
+        memory_mode = data.get('memory_mode')
 
         # Verify max_rounds Parameters
         if max_rounds is not None:
@@ -1578,6 +1609,7 @@ def start_simulation():
         
         # Get knowledge graphID（For knowledge graph memory update）
         graph_id = None
+        storage = None
         if enable_graph_memory_update:
             # Get from simulation status or project graph_id
             graph_id = state.graph_id
@@ -1594,6 +1626,12 @@ def start_simulation():
                 }), 400
             
             logger.info(f"Enable knowledge graph memory update: simulation_id={simulation_id}, graph_id={graph_id}")
+            storage = current_app.extensions.get('neo4j_storage')
+            if not storage:
+                return jsonify({
+                    "success": False,
+                    "error": "Enable knowledge graph memory update requires GraphStorage/Neo4j connection"
+                }), 500
         
         # Start simulation
         run_state = SimulationRunner.start_simulation(
@@ -1601,7 +1639,11 @@ def start_simulation():
             platform=platform,
             max_rounds=max_rounds,
             enable_graph_memory_update=enable_graph_memory_update,
-            graph_id=graph_id
+            graph_id=graph_id,
+            storage=storage,
+            scenario_id=scenario_id,
+            seed=seed,
+            memory_mode=memory_mode,
         )
         
         # Update simulation status
@@ -1615,6 +1657,12 @@ def start_simulation():
         response_data['force_restarted'] = force_restarted
         if enable_graph_memory_update:
             response_data['graph_id'] = graph_id
+        if scenario_id:
+            response_data['scenario_id'] = scenario_id
+        if seed is not None:
+            response_data['seed'] = seed
+        if memory_mode:
+            response_data['memory_mode'] = memory_mode
         
         return jsonify({
             "success": True,

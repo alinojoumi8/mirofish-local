@@ -28,6 +28,13 @@ from .graph_tools import (
     PanoramaResult,
     InterviewResult
 )
+from .forecasting import (
+    ForecastSynthesizer,
+    forecast_to_markdown,
+    infer_report_mode_from_forecast,
+    load_simulation_config,
+    normalize_forecast_settings,
+)
 
 logger = get_logger('mirofish.report_agent')
 
@@ -460,6 +467,7 @@ class Report:
     error: Optional[str] = None
     validation_issues: List[Dict[str, Any]] = field(default_factory=list)
     quality_score: Dict[str, Any] = field(default_factory=dict)
+    forecast: Dict[str, Any] = field(default_factory=dict)
     
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -476,6 +484,7 @@ class Report:
             "error": self.error,
             "validation_issues": self.validation_issues,
             "quality_score": self.quality_score,
+            "forecast": self.forecast,
         }
 
 
@@ -488,7 +497,8 @@ REPORT_MODE_GUIDANCE = {
 [Domain Mode: General Prediction]
 - Write a future prediction report from the simulated world.
 - Prioritize projected actors, behavior, causal signals, risks, and decision points.
-- Use probabilistic language where evidence is uncertain.""",
+- Use probabilistic language where evidence is uncertain.
+- Include explicit probability ranges, assumptions, and what would change the forecast.""",
     "legal_case": """\
 [Domain Mode: Legal Case Outcome Analysis]
 - This is not legal advice and must not claim a court outcome is certain.
@@ -496,12 +506,14 @@ REPORT_MODE_GUIDANCE = {
 - Separate factual record, legal issues/elements, evidence strengths, evidence weaknesses, procedural risks, and settlement/trial posture.
 - Identify missing evidence that would materially change the assessment.
 - Do not invent statutes, case law, deadlines, or legal standards unless retrieved from the graph.
-- Avoid inflammatory advocacy. Use counsel-facing, evidence-grounded language.""",
+- Avoid inflammatory advocacy. Use counsel-facing, evidence-grounded language.
+- Include a probability table or explicit probability range for the target outcomes.""",
     "market_prediction": """\
 [Domain Mode: Market Prediction]
 - Emphasize demand signals, pricing, adoption, competitive response, revenue exposure, and timing.
 - Separate base case, upside case, downside case, and key leading indicators.
-- Keep public benchmark claims out unless retrieved from the graph.""",
+- Keep public benchmark claims out unless retrieved from the graph.
+- Include explicit probability estimates, confidence, and sensitivity to macro/news shocks.""",
     "product_risk": """\
 [Domain Mode: Product Risk]
 - Emphasize user behavior, adoption friction, operational risks, trust/safety issues, and mitigation options.
@@ -983,6 +995,13 @@ class ReportAgent:
         self.simulation_requirement = simulation_requirement
         self.disable_interviews = disable_interviews
         self.strict_antirepetition = strict_antirepetition
+        self.simulation_config = load_simulation_config(simulation_id)
+        self.forecast_settings = normalize_forecast_settings(
+            self.simulation_config,
+            simulation_requirement=simulation_requirement,
+        ).to_dict()
+        if report_mode == "prediction" and self.forecast_settings.get("forecast_mode") != "general":
+            report_mode = infer_report_mode_from_forecast(self.forecast_settings.get("forecast_mode"))
         self.report_mode = normalize_report_mode(report_mode)
 
         self.llm = llm_client or LLMClient()
@@ -1004,7 +1023,34 @@ class ReportAgent:
         logger.info(f"ReportAgent initialization complete: graph_id={graph_id}, simulation_id={simulation_id}")
 
     def _report_mode_guidance(self) -> str:
-        return REPORT_MODE_GUIDANCE[self.report_mode]
+        forecast_lines = [
+            "[Forecast Output Contract]",
+            f"- Forecast mode: {self.forecast_settings.get('forecast_mode', 'general')}",
+            f"- Forecast horizon: {self.forecast_settings.get('forecast_horizon', 'medium_term')}",
+            f"- Prediction target: {(self.forecast_settings.get('prediction_target') or {}).get('question', self.simulation_requirement)}",
+            "- Every section should support the final probability estimate with evidence, assumptions, and sensitivity.",
+            "- Use explicit probabilities or probability ranges; never imply certainty.",
+        ]
+        outcomes = (self.forecast_settings.get("prediction_target") or {}).get("outcomes") or []
+        if outcomes:
+            forecast_lines.append("- Target outcomes: " + "; ".join(str(outcome) for outcome in outcomes))
+        return REPORT_MODE_GUIDANCE[self.report_mode] + "\n\n" + "\n".join(forecast_lines)
+
+    def _apply_forecast_synthesis(self, report: Report, outline: Optional[ReportOutline]) -> None:
+        """Attach structured forecast data and prepend a compact forecast table."""
+        evidence_cards: List[Dict[str, Any]] = []
+        if outline:
+            for section in outline.sections:
+                evidence_cards.extend(section.evidence_cards or [])
+
+        report.forecast = ForecastSynthesizer(
+            self.simulation_id,
+            self.simulation_config,
+        ).synthesize(report.markdown_content or "", evidence_cards)
+
+        forecast_markdown = forecast_to_markdown(report.forecast)
+        if forecast_markdown and "## Forecast Probability Summary" not in (report.markdown_content or ""):
+            report.markdown_content = f"{forecast_markdown}\n\n{report.markdown_content or ''}".strip()
     
     def _define_tools(self) -> Dict[str, Dict[str, Any]]:
         """Define available tools"""
@@ -1922,6 +1968,7 @@ class ReportAgent:
             
             # Using ReportManagerassembleComplete report
             report.markdown_content = ReportManager.assemble_full_report(report_id, outline)
+            self._apply_forecast_synthesis(report, outline)
             report.validation_issues = ReportManager.validate_report_output(report)
             report.quality_score = ReportManager.evaluate_report_quality(report)
             blocking_issues = [issue for issue in report.validation_issues if issue.get("blocking")]
@@ -2053,6 +2100,7 @@ class ReportAgent:
             )
 
             report.markdown_content = ReportManager.assemble_full_report(report.report_id, report.outline)
+            self._apply_forecast_synthesis(report, report.outline)
             report.validation_issues = ReportManager.validate_report_output(report)
             blocking_issues = [issue for issue in report.validation_issues if issue.get("blocking")]
             if blocking_issues:
@@ -2973,8 +3021,18 @@ class ReportManager:
 
     @staticmethod
     def _extract_report_sections(content: str) -> List[str]:
-        parts = re.split(r"(?m)^##\s+.+$", content or "")
-        return [part.strip() for part in parts if part.strip()]
+        matches = list(re.finditer(r"(?m)^##\s+(.+)$", content or ""))
+        sections = []
+        for idx, match in enumerate(matches):
+            title = match.group(1).strip().lower()
+            if title == "forecast probability summary":
+                continue
+            start = match.end()
+            end = matches[idx + 1].start() if idx + 1 < len(matches) else len(content or "")
+            section = (content or "")[start:end].strip()
+            if section:
+                sections.append(section)
+        return sections
 
     @staticmethod
     def _extract_report_sentences(content: str) -> List[str]:
@@ -3077,6 +3135,7 @@ class ReportManager:
             error=data.get('error'),
             validation_issues=data.get('validation_issues', []),
             quality_score=data.get('quality_score', {}),
+            forecast=data.get('forecast', {}),
         )
     
     @classmethod

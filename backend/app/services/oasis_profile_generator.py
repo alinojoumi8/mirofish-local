@@ -21,6 +21,7 @@ from ..config import Config
 from ..utils.logger import get_logger
 from .entity_reader import EntityNode
 from ..storage import GraphStorage
+from .forecasting import domain_guidance_for_forecast, normalize_forecast_settings
 
 logger = get_logger('mirofish.oasis_profile')
 
@@ -50,6 +51,17 @@ class OasisAgentProfile:
     country: Optional[str] = None
     profession: Optional[str] = None
     interested_topics: List[str] = field(default_factory=list)
+
+    # Forecast-specific behavior fields
+    forecast_role: str = "general forecaster"
+    private_beliefs: str = ""
+    public_position: str = ""
+    goals: str = ""
+    constraints: str = ""
+    known_facts: str = ""
+    unknowns: str = ""
+    decision_rules: str = ""
+    risk_tolerance: str = "medium"
 
     # Source entity information
     source_entity_uuid: Optional[str] = None
@@ -82,6 +94,7 @@ class OasisAgentProfile:
             profile["profession"] = self.profession
         if self.interested_topics:
             profile["interested_topics"] = self.interested_topics
+        self._add_forecast_fields(profile)
         
         return profile
     
@@ -112,6 +125,7 @@ class OasisAgentProfile:
             profile["profession"] = self.profession
         if self.interested_topics:
             profile["interested_topics"] = self.interested_topics
+        self._add_forecast_fields(profile)
         
         return profile
     
@@ -133,10 +147,30 @@ class OasisAgentProfile:
             "country": self.country,
             "profession": self.profession,
             "interested_topics": self.interested_topics,
+            "forecast_role": self.forecast_role,
+            "private_beliefs": self.private_beliefs,
+            "public_position": self.public_position,
+            "goals": self.goals,
+            "constraints": self.constraints,
+            "known_facts": self.known_facts,
+            "unknowns": self.unknowns,
+            "decision_rules": self.decision_rules,
+            "risk_tolerance": self.risk_tolerance,
             "source_entity_uuid": self.source_entity_uuid,
             "source_entity_type": self.source_entity_type,
             "created_at": self.created_at,
         }
+
+    def _add_forecast_fields(self, profile: Dict[str, Any]) -> None:
+        profile["forecast_role"] = self.forecast_role
+        profile["private_beliefs"] = self.private_beliefs
+        profile["public_position"] = self.public_position
+        profile["goals"] = self.goals
+        profile["constraints"] = self.constraints
+        profile["known_facts"] = self.known_facts
+        profile["unknowns"] = self.unknowns
+        profile["decision_rules"] = self.decision_rules
+        profile["risk_tolerance"] = self.risk_tolerance
 
 
 class OasisProfileGenerator:
@@ -183,7 +217,8 @@ class OasisProfileGenerator:
         base_url: Optional[str] = None,
         model_name: Optional[str] = None,
         storage: Optional[GraphStorage] = None,
-        graph_id: Optional[str] = None
+        graph_id: Optional[str] = None,
+        forecast_settings: Optional[Dict[str, Any]] = None,
     ):
         self.api_key = api_key or Config.LLM_API_KEY
         self.base_url = base_url or Config.LLM_BASE_URL
@@ -200,6 +235,10 @@ class OasisProfileGenerator:
         # GraphStorage for hybrid search enrichment
         self.storage = storage
         self.graph_id = graph_id
+        self.forecast_settings = normalize_forecast_settings(
+            forecast_settings or {},
+            simulation_requirement=(forecast_settings or {}).get("simulation_requirement", ""),
+        ).to_dict()
     
     def generate_profile_from_entity(
         self,
@@ -261,6 +300,15 @@ class OasisProfileGenerator:
             country=profile_data.get("country"),
             profession=profile_data.get("profession"),
             interested_topics=profile_data.get("interested_topics", []),
+            forecast_role=profile_data.get("forecast_role", "general forecaster"),
+            private_beliefs=profile_data.get("private_beliefs", ""),
+            public_position=profile_data.get("public_position", ""),
+            goals=profile_data.get("goals", ""),
+            constraints=profile_data.get("constraints", ""),
+            known_facts=profile_data.get("known_facts", ""),
+            unknowns=profile_data.get("unknowns", ""),
+            decision_rules=profile_data.get("decision_rules", ""),
+            risk_tolerance=profile_data.get("risk_tolerance", "medium"),
             source_entity_uuid=entity.uuid,
             source_entity_type=entity_type,
         )
@@ -500,7 +548,7 @@ class OasisProfileGenerator:
                     if "persona" not in result or not result["persona"]:
                         result["persona"] = entity_summary or f"{entity_name} is a {entity_type}."
 
-                    return result
+                    return self._apply_forecast_profile_fields(result, entity_name, entity_type, entity_summary)
 
                 except json.JSONDecodeError as je:
                     logger.warning(f"JSON parsing failed (attempt {attempt+1}): {str(je)[:80]}")
@@ -509,7 +557,7 @@ class OasisProfileGenerator:
                     result = self._try_fix_json(content, entity_name, entity_type, entity_summary)
                     if result.get("_fixed"):
                         del result["_fixed"]
-                        return result
+                        return self._apply_forecast_profile_fields(result, entity_name, entity_type, entity_summary)
 
                     last_error = je
 
@@ -520,9 +568,9 @@ class OasisProfileGenerator:
                 time.sleep(1 * (attempt + 1))  # Exponential backoff
 
         logger.warning(f"LLM persona generation failed ({max_attempts} attempts): {last_error}, using rule-based generation")
-        return self._generate_profile_rule_based(
+        return self._apply_forecast_profile_fields(self._generate_profile_rule_based(
             entity_name, entity_type, entity_summary, entity_attributes
-        )
+        ), entity_name, entity_type, entity_summary)
     
     def _fix_truncated_json(self, content: str) -> str:
         """Fix truncated JSON (output truncated by max_tokens limit)"""
@@ -615,8 +663,95 @@ class OasisProfileGenerator:
     
     def _get_system_prompt(self, is_individual: bool) -> str:
         """Get system prompt"""
-        base_prompt = "You are an expert in generating social media user profiles. Generate detailed, realistic personas for opinion simulation that maximize restoration of existing reality. Must return valid JSON format with all string values containing no unescaped newlines. Use English."
+        base_prompt = (
+            "You are an expert in generating simulation personas for probabilistic forecasting. "
+            "Generate detailed, realistic personas that maximize restoration of existing reality and support forecast reasoning. "
+            "Must return valid JSON format with all string values containing no unescaped newlines. Use English."
+        )
         return base_prompt
+
+    def _forecast_prompt_block(self) -> str:
+        return f"""
+
+Forecast Controls:
+{domain_guidance_for_forecast(self.forecast_settings)}
+
+Additional required JSON fields for prediction quality:
+9. forecast_role: Domain role in this forecast, such as judge, plaintiff, counsel, expert, regulator, analyst, trader, company, consumer, media, or neutral observer.
+10. private_beliefs: What this agent privately thinks is likely, including uncertainty.
+11. public_position: What this agent is willing to say publicly.
+12. goals: What this agent is trying to maximize or avoid.
+13. constraints: Legal, financial, reputational, procedural, liquidity, or operational constraints.
+14. known_facts: Most important facts this agent knows from the graph.
+15. unknowns: Key missing facts that would change this agent's forecast.
+16. decision_rules: How this agent updates probabilities and decides actions.
+17. risk_tolerance: low, medium, or high.
+
+The persona must not generate generic welcome posts. All public actions should reveal forecast-relevant evidence, incentives, uncertainty, or scenario reaction."""
+
+    def _infer_forecast_role(self, entity_type: str) -> str:
+        mode = self.forecast_settings.get("forecast_mode", "general")
+        etype = entity_type.lower()
+        if mode == "legal_case":
+            if any(term in etype for term in ["judge", "court"]):
+                return "judge/court decision-maker"
+            if any(term in etype for term in ["plaintiff", "claimant"]):
+                return "plaintiff-side actor"
+            if any(term in etype for term in ["defendant", "respondent"]):
+                return "defense-side actor"
+            if any(term in etype for term in ["lawyer", "attorney", "counsel"]):
+                return "legal counsel"
+            if any(term in etype for term in ["expert", "witness"]):
+                return "evidence expert or witness"
+            if any(term in etype for term in ["regulator", "government"]):
+                return "regulator"
+            return "legal-case stakeholder"
+        if mode == "market_economy":
+            if any(term in etype for term in ["bank", "central", "regulator", "government"]):
+                return "policy or regulatory actor"
+            if any(term in etype for term in ["company", "firm", "issuer"]):
+                return "company operator"
+            if any(term in etype for term in ["analyst", "expert"]):
+                return "market analyst"
+            if any(term in etype for term in ["consumer", "customer"]):
+                return "demand-side actor"
+            if any(term in etype for term in ["investor", "trader", "fund"]):
+                return "capital-market actor"
+            return "market/economy stakeholder"
+        return "general forecaster"
+
+    def _apply_forecast_profile_fields(
+        self,
+        profile_data: Dict[str, Any],
+        entity_name: str,
+        entity_type: str,
+        entity_summary: str,
+    ) -> Dict[str, Any]:
+        role = profile_data.get("forecast_role") or self._infer_forecast_role(entity_type)
+        target = self.forecast_settings.get("prediction_target", {})
+        question = target.get("question") or "the forecast target"
+        profile_data["forecast_role"] = role
+        profile_data.setdefault("private_beliefs", f"{entity_name} privately updates probabilities about {question} from evidence and incentives.")
+        profile_data.setdefault("public_position", f"{entity_name} publicly communicates only forecast-relevant positions tied to known facts.")
+        profile_data.setdefault("goals", "Maximize forecast-relevant interests while protecting credibility and strategic position.")
+        profile_data.setdefault("constraints", "Limited to facts available in the uploaded graph and this agent's role-specific incentives.")
+        profile_data.setdefault("known_facts", entity_summary or f"{entity_name} is represented in the graph as {entity_type}.")
+        profile_data.setdefault("unknowns", "Missing base rates, private communications, and fresh real-world updates may change the forecast.")
+        profile_data.setdefault("decision_rules", "Update beliefs when new events shift evidence strength, procedural leverage, demand, liquidity, or strategic incentives.")
+        profile_data.setdefault("risk_tolerance", "medium")
+
+        forecast_clause = (
+            f" Forecast role: {profile_data['forecast_role']}. "
+            f"Private beliefs: {profile_data['private_beliefs']} "
+            f"Public position: {profile_data['public_position']} "
+            f"Goals: {profile_data['goals']} Constraints: {profile_data['constraints']} "
+            f"Decision rules: {profile_data['decision_rules']} "
+            "Never produce generic greetings; every action should add forecast signal."
+        )
+        persona = profile_data.get("persona") or entity_summary or f"{entity_name} is a {entity_type}."
+        if "Forecast role:" not in persona:
+            profile_data["persona"] = f"{persona} {forecast_clause}"
+        return profile_data
     
     def _build_individual_persona_prompt(
         self,
@@ -640,6 +775,8 @@ Entity Attributes: {attrs_str}
 
 Context Information:
 {context_str}
+
+{self._forecast_prompt_block()}
 
 Please generate JSON containing the following fields:
 
@@ -689,6 +826,8 @@ Entity Attributes: {attrs_str}
 
 Context Information:
 {context_str}
+
+{self._forecast_prompt_block()}
 
 Please generate JSON containing the following fields:
 
@@ -878,13 +1017,28 @@ Important:
 
             except Exception as e:
                 logger.error(f"Failed to generate persona for entity {entity.name}: {str(e)}")
+                forecast_profile = self._apply_forecast_profile_fields(
+                    self._generate_profile_rule_based(entity.name, entity_type, entity.summary, entity.attributes),
+                    entity.name,
+                    entity_type,
+                    entity.summary,
+                )
                 # Create a fallback profile
                 fallback_profile = OasisAgentProfile(
                     user_id=idx,
                     user_name=self._generate_username(entity.name),
                     name=entity.name,
-                    bio=f"{entity_type}: {entity.name}",
-                    persona=entity.summary or f"A participant in social discussions.",
+                    bio=forecast_profile.get("bio", f"{entity_type}: {entity.name}"),
+                    persona=forecast_profile.get("persona", entity.summary or f"A participant in forecasting discussions."),
+                    forecast_role=forecast_profile.get("forecast_role", "general forecaster"),
+                    private_beliefs=forecast_profile.get("private_beliefs", ""),
+                    public_position=forecast_profile.get("public_position", ""),
+                    goals=forecast_profile.get("goals", ""),
+                    constraints=forecast_profile.get("constraints", ""),
+                    known_facts=forecast_profile.get("known_facts", ""),
+                    unknowns=forecast_profile.get("unknowns", ""),
+                    decision_rules=forecast_profile.get("decision_rules", ""),
+                    risk_tolerance=forecast_profile.get("risk_tolerance", "medium"),
                     source_entity_uuid=entity.uuid,
                     source_entity_type=entity_type,
                 )
@@ -935,12 +1089,27 @@ Important:
                     logger.error(f"Exception occurred while processing entity {entity.name}: {str(e)}")
                     with lock:
                         completed_count[0] += 1
+                    forecast_profile = self._apply_forecast_profile_fields(
+                        self._generate_profile_rule_based(entity.name, entity_type, entity.summary, entity.attributes),
+                        entity.name,
+                        entity_type,
+                        entity.summary,
+                    )
                     profiles[idx] = OasisAgentProfile(
                         user_id=idx,
                         user_name=self._generate_username(entity.name),
                         name=entity.name,
-                        bio=f"{entity_type}: {entity.name}",
-                        persona=entity.summary or "A participant in social discussions.",
+                        bio=forecast_profile.get("bio", f"{entity_type}: {entity.name}"),
+                        persona=forecast_profile.get("persona", entity.summary or "A participant in forecasting discussions."),
+                        forecast_role=forecast_profile.get("forecast_role", "general forecaster"),
+                        private_beliefs=forecast_profile.get("private_beliefs", ""),
+                        public_position=forecast_profile.get("public_position", ""),
+                        goals=forecast_profile.get("goals", ""),
+                        constraints=forecast_profile.get("constraints", ""),
+                        known_facts=forecast_profile.get("known_facts", ""),
+                        unknowns=forecast_profile.get("unknowns", ""),
+                        decision_rules=forecast_profile.get("decision_rules", ""),
+                        risk_tolerance=forecast_profile.get("risk_tolerance", "medium"),
                         source_entity_uuid=entity.uuid,
                         source_entity_type=entity_type,
                     )
@@ -1041,6 +1210,16 @@ Important:
                 user_char = profile.bio
                 if profile.persona and profile.persona != profile.bio:
                     user_char = f"{profile.bio} {profile.persona}"
+                forecast_char = (
+                    f" Forecast role: {profile.forecast_role}. "
+                    f"Private beliefs: {profile.private_beliefs}. "
+                    f"Public position: {profile.public_position}. "
+                    f"Goals: {profile.goals}. Constraints: {profile.constraints}. "
+                    f"Known facts: {profile.known_facts}. Unknowns: {profile.unknowns}. "
+                    f"Decision rules: {profile.decision_rules}. Risk tolerance: {profile.risk_tolerance}."
+                )
+                if "Forecast role:" not in user_char:
+                    user_char = f"{user_char} {forecast_char}"
                 # Handle newlines (replace with space in CSV)
                 user_char = user_char.replace('\n', ' ').replace('\r', ' ')
 
@@ -1119,6 +1298,7 @@ Important:
                 item["profession"] = profile.profession
             if profile.interested_topics:
                 item["interested_topics"] = profile.interested_topics
+            profile._add_forecast_fields(item)
 
             data.append(item)
 

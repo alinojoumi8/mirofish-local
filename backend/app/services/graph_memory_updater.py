@@ -57,6 +57,35 @@ class AgentActivity:
 
         return f"{self.agent_name}: {description}"
 
+    def visibility(self) -> str:
+        private_actions = {"SEARCH_POSTS", "SEARCH_USER", "MUTE"}
+        return "private" if self.action_type in private_actions else "public"
+
+    def importance(self) -> float:
+        if self.action_type in {"CREATE_POST", "QUOTE_POST", "CREATE_COMMENT"}:
+            return 0.75
+        if self.action_type in {"REPOST", "FOLLOW"}:
+            return 0.55
+        if self.action_type in {"LIKE_POST", "LIKE_COMMENT", "DISLIKE_POST", "DISLIKE_COMMENT"}:
+            return 0.35
+        return 0.25
+
+    def to_memory_record(self) -> Dict[str, Any]:
+        text = self.to_episode_text()
+        return {
+            "agent_id": self.agent_id,
+            "agent_name": self.agent_name,
+            "platform": self.platform,
+            "action_type": self.action_type,
+            "text": text,
+            "round_num": self.round_num,
+            "timestamp": self.timestamp,
+            "importance": self.importance(),
+            "recency": self.timestamp,
+            "source": f"simulation:{self.platform}",
+            "visibility": self.visibility(),
+        }
+
     def _describe_create_post(self) -> str:
         content = self.action_args.get("content", "")
         if content:
@@ -320,6 +349,11 @@ class GraphMemoryUpdater:
 
         for attempt in range(self.MAX_RETRIES):
             try:
+                if hasattr(self.storage, "add_agent_memories"):
+                    self.storage.add_agent_memories(
+                        self.graph_id,
+                        [activity.to_memory_record() for activity in activities],
+                    )
                 self.storage.add_text(self.graph_id, combined_text)
 
                 self._total_sent += 1

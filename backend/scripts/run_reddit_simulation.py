@@ -48,6 +48,12 @@ else:
 
 
 import re
+from forecast_runtime import (
+    due_scheduled_events,
+    inject_agent_forecast_memory,
+    record_actions_to_short_memory,
+    select_active_agents_for_round,
+)
 
 
 class UnicodeFormatter(logging.Formatter):
@@ -116,8 +122,7 @@ def setup_oasis_logging(log_dir: str):
 
 
 try:
-    from camel.models import ModelFactory
-    from camel.types import ModelPlatformType
+    from llm_provider_adapter import create_oasis_model_from_env
     import oasis
     from oasis import (
         ActionType,
@@ -421,7 +426,13 @@ class RedditSimulationRunner:
     def _load_config(self) -> Dict[str, Any]:
         """Load configuration file"""
         with open(self.config_path, 'r', encoding='utf-8') as f:
-            return json.load(f)
+            config = json.load(f)
+        if config.get("seed") is not None:
+            try:
+                random.seed(int(config["seed"]))
+            except (TypeError, ValueError):
+                random.seed(str(config["seed"]))
+        return config
     
     def _get_profile_path(self) -> str:
         """Get Profile file path"""
@@ -440,31 +451,7 @@ class RedditSimulationRunner:
         - LLM_BASE_URL: API base URL
         - LLM_MODEL_NAME: Model name
         """
-        # Read configuration from .env first
-        llm_api_key = os.environ.get("LLM_API_KEY", "")
-        llm_base_url = os.environ.get("LLM_BASE_URL", "")
-        llm_model = os.environ.get("LLM_MODEL_NAME", "")
-        
-        # If not in .env, use config as fallback
-        if not llm_model:
-            llm_model = self.config.get("llm_model", "gpt-4o-mini")
-        
-        # Set environment variables required by camel-ai
-        if llm_api_key:
-            os.environ["OPENAI_API_KEY"] = llm_api_key
-        
-        if not os.environ.get("OPENAI_API_KEY"):
-            raise ValueError("Missing API Key configuration, please set LLM_API_KEY in .env file in project root")
-        
-        if llm_base_url:
-            os.environ["OPENAI_API_BASE_URL"] = llm_base_url
-        
-        print(f"LLM configuration: model={llm_model}, base_url={llm_base_url[:40] if llm_base_url else 'default'}...")
-        
-        return ModelFactory.create(
-            model_platform=ModelPlatformType.OPENAI,
-            model_type=llm_model,
-        )
+        return create_oasis_model_from_env(self.config)
     
     def _get_active_agents_for_round(
         self, 
@@ -475,50 +462,7 @@ class RedditSimulationRunner:
         """
         Decide which Agents to activate this round based on time and configuration
         """
-        time_config = self.config.get("time_config", {})
-        agent_configs = self.config.get("agent_configs", [])
-        
-        base_min = time_config.get("agents_per_hour_min", 5)
-        base_max = time_config.get("agents_per_hour_max", 20)
-        
-        peak_hours = time_config.get("peak_hours", [9, 10, 11, 14, 15, 20, 21, 22])
-        off_peak_hours = time_config.get("off_peak_hours", [0, 1, 2, 3, 4, 5])
-        
-        if current_hour in peak_hours:
-            multiplier = time_config.get("peak_activity_multiplier", 1.5)
-        elif current_hour in off_peak_hours:
-            multiplier = time_config.get("off_peak_activity_multiplier", 0.3)
-        else:
-            multiplier = 1.0
-        
-        target_count = int(random.uniform(base_min, base_max) * multiplier)
-        
-        candidates = []
-        for cfg in agent_configs:
-            agent_id = cfg.get("agent_id", 0)
-            active_hours = cfg.get("active_hours", list(range(8, 23)))
-            activity_level = cfg.get("activity_level", 0.5)
-            
-            if current_hour not in active_hours:
-                continue
-            
-            if random.random() < activity_level:
-                candidates.append(agent_id)
-        
-        selected_ids = random.sample(
-            candidates, 
-            min(target_count, len(candidates))
-        ) if candidates else []
-        
-        active_agents = []
-        for agent_id in selected_ids:
-            try:
-                agent = env.agent_graph.get_agent(agent_id)
-                active_agents.append((agent_id, agent))
-            except Exception:
-                pass
-        
-        return active_agents
+        return select_active_agents_for_round(env, self.config, current_hour, round_num)
     
     async def run(self, max_rounds: int = None):
         """Run Reddit simulation
@@ -627,6 +571,26 @@ class RedditSimulationRunner:
             simulated_minutes = round_num * minutes_per_round
             simulated_hour = (simulated_minutes // 60) % 24
             simulated_day = simulated_minutes // (60 * 24) + 1
+
+            event_context = None
+            scheduled_events = due_scheduled_events(self.config, round_num + 1, simulated_hour, "reddit")
+            if scheduled_events:
+                event_actions = {}
+                for event in scheduled_events:
+                    agent_id = event.get("poster_agent_id", 0)
+                    content = event.get("content", "")
+                    event_context = f"{event.get('title', 'Scheduled event')}: {content}"
+                    try:
+                        agent = self.env.agent_graph.get_agent(agent_id)
+                        event_actions[agent] = ManualAction(
+                            action_type=ActionType.CREATE_POST,
+                            action_args={"content": content}
+                        )
+                    except Exception as e:
+                        print(f"  Warning: Unable to trigger scheduled event for Agent {agent_id}: {e}")
+                if event_actions:
+                    await self.env.step(event_actions)
+                    print(f"  Triggered {len(event_actions)} scheduled forecast events")
             
             active_agents = self._get_active_agents_for_round(
                 self.env, simulated_hour, round_num
@@ -635,6 +599,18 @@ class RedditSimulationRunner:
             if not active_agents:
                 continue
             
+            for agent_id, agent in active_agents:
+                inject_agent_forecast_memory(
+                    agent,
+                    agent_id,
+                    self.config,
+                    self.simulation_dir,
+                    "reddit",
+                    round_num + 1,
+                    simulated_hour,
+                    event_context,
+                )
+
             actions = {
                 agent: LLMAction()
                 for _, agent in active_agents
