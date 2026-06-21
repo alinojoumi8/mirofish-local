@@ -9,6 +9,7 @@ import json
 import time
 import uuid
 import logging
+import threading
 from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional, Callable
 
@@ -35,6 +36,8 @@ class Neo4jStorage(GraphStorage):
 
     MAX_RETRIES = 3
     RETRY_DELAY_BASE = 1  # seconds
+    _schema_init_lock = threading.Lock()
+    _schema_initialized_keys = set()
 
     def __init__(
         self,
@@ -118,12 +121,19 @@ class Neo4jStorage(GraphStorage):
 
     def _ensure_schema(self):
         """Create indexes and constraints if they don't exist."""
-        with self._driver.session() as session:
-            for query in neo4j_schema.ALL_SCHEMA_QUERIES:
-                try:
-                    session.run(query)
-                except Exception as e:
-                    logger.warning(f"Schema query warning (may already exist): {e}")
+        schema_key = (self._uri, self._user)
+        with self._schema_init_lock:
+            if schema_key in self._schema_initialized_keys:
+                return
+
+            with self._driver.session() as session:
+                for query in neo4j_schema.ALL_SCHEMA_QUERIES:
+                    try:
+                        session.run(query)
+                    except Exception as e:
+                        logger.warning(f"Schema query warning (may already exist): {e}")
+
+            self._schema_initialized_keys.add(schema_key)
 
     # ----------------------------------------------------------------
     # Retry wrapper
@@ -386,6 +396,17 @@ class Neo4jStorage(GraphStorage):
                 """,
                 gid=graph_id,
             ).single()
+            try:
+                uncited_fact_record = session.run(
+                    """
+                    MATCH ()-[r:RELATION {graph_id: $gid}]->()
+                    WHERE r.episode_ids IS NULL OR size(r.episode_ids) = 0
+                    RETURN count(r) AS uncited_facts
+                    """,
+                    gid=graph_id,
+                ).single()
+            except Exception:
+                uncited_fact_record = {"uncited_facts": 0}
 
         node_count = int(node_record["total"] or 0)
         edge_count = int(rel_record["total"] or 0)
@@ -397,6 +418,7 @@ class Neo4jStorage(GraphStorage):
         duplicate_name_groups = int(duplicate_record["duplicate_name_groups"] or 0)
         duplicate_nodes = int(duplicate_record["duplicate_nodes"] or 0)
         episode_count = int(episode_record["episode_count"] or 0)
+        uncited_facts = int(uncited_fact_record["uncited_facts"] or 0)
 
         relation_density = edge_count / node_count if node_count else 0.0
         isolated_ratio = isolated_nodes / node_count if node_count else 0.0
@@ -463,6 +485,14 @@ class Neo4jStorage(GraphStorage):
             "empty_facts": empty_facts,
             "duplicate_name_groups": duplicate_name_groups,
             "duplicate_nodes": duplicate_nodes,
+            "duplicate_entities": duplicate_nodes,
+            "orphan_facts": empty_facts,
+            "uncited_facts": uncited_facts,
+            "search_readiness": {
+                "ready": bool(embedding_status.get("safe_to_report")),
+                "vector_coverage": embedding_status.get("vector_coverage", 0.0),
+                "issues": embedding_status.get("issues", []),
+            },
             "embedding": embedding_status,
             "deductions": deductions,
         }
@@ -810,6 +840,7 @@ class Neo4jStorage(GraphStorage):
         progress_callback: Optional[Callable] = None,
         cache_context: Optional[Dict[str, Any]] = None,
         profile_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+        chunk_metadata: Optional[List[Dict[str, Any]]] = None,
     ) -> List[str]:
         """Batch-add text chunks with cached batched NER extraction."""
         batch_started = time.perf_counter()
@@ -867,17 +898,20 @@ class Neo4jStorage(GraphStorage):
                 if self._extraction_cache:
                     self._extraction_cache.set(file_hash, chunk_hash, ontology_hash, extraction)
 
-        for i, chunk in enumerate(chunks):
-            if not chunk or not chunk.strip():
-                continue
-            episode_id = self._write_extraction(graph_id, chunk, extractions[i], profile=profile)
-            episode_ids.append(episode_id)
+        ordered_extractions = [extractions.get(i, {"entities": [], "relations": []}) for i in range(len(chunks))]
+        write_kwargs = {"profile": profile}
+        if chunk_metadata is not None:
+            write_kwargs["chunk_metadata"] = chunk_metadata
+        episode_ids = self._write_extractions_batch(
+            graph_id,
+            chunks,
+            ordered_extractions,
+            **write_kwargs,
+        )
 
-            if progress_callback:
-                progress = (i + 1) / total
-                progress_callback(progress)
-
-            logger.info(f"Processed chunk {i + 1}/{total}")
+        if progress_callback:
+            progress_callback(1.0)
+        logger.info("Processed batch of %s chunks", total)
 
         profile["total_seconds"] = time.perf_counter() - batch_started
         for key, value in list(profile.items()):
@@ -887,6 +921,251 @@ class Neo4jStorage(GraphStorage):
             profile_callback(profile)
 
         return episode_ids
+
+    def _write_extractions_batch(
+        self,
+        graph_id: str,
+        chunks: List[str],
+        extractions: List[Dict[str, Any]],
+        profile: Optional[Dict[str, Any]] = None,
+        chunk_metadata: Optional[List[Dict[str, Any]]] = None,
+    ) -> List[str]:
+        """Embed and write a full graph-build batch with bulk Cypher queries."""
+        now = datetime.now(timezone.utc).isoformat()
+        episode_rows = []
+        entity_rows_by_key: Dict[str, Dict[str, Any]] = {}
+        relation_specs = []
+        embed_texts: List[str] = []
+
+        metadata_rows = chunk_metadata or [{} for _ in chunks]
+        for chunk_index, (chunk, extraction) in enumerate(zip(chunks, extractions)):
+            metadata = metadata_rows[chunk_index] if chunk_index < len(metadata_rows) else {}
+            episode_id = str(uuid.uuid4())
+            episode_rows.append({
+                "uuid": episode_id,
+                "graph_id": graph_id,
+                "data": chunk,
+                "created_at": now,
+                "case_id": metadata.get("case_id"),
+                "case_version_id": metadata.get("version_id") or metadata.get("case_version_id"),
+                "document_id": metadata.get("document_id"),
+                "filename": metadata.get("filename"),
+                "document_type": metadata.get("document_type"),
+                "chunk_index": metadata.get("chunk_index"),
+                "page": metadata.get("page"),
+                "paragraph": metadata.get("paragraph"),
+            })
+
+            local_entity_keys: Dict[str, str] = {}
+            for entity in extraction.get("entities", []):
+                name = str(entity.get("name", "")).strip()
+                etype = str(entity.get("type", "Entity") or "Entity").strip() or "Entity"
+                if not name:
+                    continue
+                name_lower = name.lower()
+                if name_lower not in entity_rows_by_key:
+                    summary = f"{name} ({etype})"
+                    entity_rows_by_key[name_lower] = {
+                        "uuid": str(uuid.uuid4()),
+                        "graph_id": graph_id,
+                        "name_lower": name_lower,
+                        "name": name,
+                        "type": etype,
+                        "summary": summary,
+                        "attributes_json": json.dumps(entity.get("attributes", {}) or {}, ensure_ascii=False),
+                        "embedding_index": len(embed_texts),
+                        "embedding": [],
+                        "created_at": now,
+                    }
+                    embed_texts.append(summary)
+                local_entity_keys[name_lower] = name_lower
+
+            for relation in extraction.get("relations", []):
+                source_key = str(relation.get("source", "")).strip().lower()
+                target_key = str(relation.get("target", "")).strip().lower()
+                if not source_key or not target_key:
+                    continue
+                fact = str(
+                    relation.get("fact")
+                    or f"{relation.get('source', '')} {relation.get('type', '')} {relation.get('target', '')}"
+                ).strip()
+                relation_specs.append({
+                    "uuid": str(uuid.uuid4()),
+                    "graph_id": graph_id,
+                    "source_key": source_key,
+                    "target_key": target_key,
+                    "name": str(relation.get("type", "RELATED_TO") or "RELATED_TO"),
+                    "fact": fact,
+                    "embedding_index": len(embed_texts),
+                    "embedding": [],
+                    "episode_id": episode_id,
+                    "created_at": now,
+                    "case_id": metadata.get("case_id"),
+                    "case_version_id": metadata.get("version_id") or metadata.get("case_version_id"),
+                    "document_id": metadata.get("document_id"),
+                    "filename": metadata.get("filename"),
+                    "document_type": metadata.get("document_type"),
+                    "chunk_index": metadata.get("chunk_index"),
+                    "page": metadata.get("page"),
+                    "paragraph": metadata.get("paragraph"),
+                })
+                embed_texts.append(fact)
+
+        embedding_start = time.perf_counter()
+        embeddings: List[List[float]] = []
+        if embed_texts:
+            logger.info("[add_text_batch] Batch-embedding %s texts across %s chunks...", len(embed_texts), len(chunks))
+            try:
+                embeddings = self._embedding.embed_batch(embed_texts)
+            except Exception as e:
+                raise EmbeddingError(
+                    "Batch embedding failed. Graph build stopped to avoid storing empty vectors. "
+                    f"Provider={self._embedding.provider_id()} Error={e}"
+                ) from e
+        if profile is not None:
+            profile["embedding_seconds"] = profile.get("embedding_seconds", 0.0) + (
+                time.perf_counter() - embedding_start
+            )
+
+        for row in entity_rows_by_key.values():
+            idx = row.pop("embedding_index")
+            row["embedding"] = embeddings[idx] if idx < len(embeddings) else []
+        for row in relation_specs:
+            idx = row.pop("embedding_index")
+            row["fact_embedding"] = embeddings[idx] if idx < len(embeddings) else []
+
+        write_start = time.perf_counter()
+        entity_rows = list(entity_rows_by_key.values())
+        with self._driver.session() as session:
+            if episode_rows:
+                def _create_episodes(tx):
+                    tx.run(
+                        """
+                        UNWIND $rows AS row
+                        CREATE (ep:Episode {
+                            uuid: row.uuid,
+                            graph_id: row.graph_id,
+                            data: row.data,
+                            processed: true,
+                            created_at: row.created_at,
+                            case_id: row.case_id,
+                            case_version_id: row.case_version_id,
+                            document_id: row.document_id,
+                            filename: row.filename,
+                            document_type: row.document_type,
+                            chunk_index: row.chunk_index,
+                            page: row.page,
+                            paragraph: row.paragraph
+                        })
+                        """,
+                        rows=episode_rows,
+                    )
+                self._call_with_retry(session.execute_write, _create_episodes)
+
+            entity_uuid_by_key: Dict[str, str] = {}
+            if entity_rows:
+                def _merge_entities(tx):
+                    result = tx.run(
+                        """
+                        UNWIND $rows AS row
+                        MERGE (n:Entity {graph_id: row.graph_id, name_lower: row.name_lower})
+                        ON CREATE SET
+                            n.uuid = row.uuid,
+                            n.name = row.name,
+                            n.summary = row.summary,
+                            n.attributes_json = row.attributes_json,
+                            n.embedding = row.embedding,
+                            n.created_at = row.created_at
+                        ON MATCH SET
+                            n.summary = CASE WHEN n.summary = '' OR n.summary IS NULL
+                                THEN row.summary ELSE n.summary END,
+                            n.attributes_json = row.attributes_json,
+                            n.embedding = row.embedding
+                        RETURN row.name_lower AS name_lower, n.uuid AS uuid
+                        """,
+                        rows=entity_rows,
+                    )
+                    return {record["name_lower"]: record["uuid"] for record in result}
+                entity_uuid_by_key = self._call_with_retry(session.execute_write, _merge_entities)
+
+                label_groups: Dict[str, List[str]] = {}
+                for row in entity_rows:
+                    etype = row.get("type")
+                    if etype and etype != "Entity":
+                        label_groups.setdefault(etype, []).append(row["name_lower"])
+                for etype, name_lowers in label_groups.items():
+                    safe_label = str(etype).replace("`", "")
+                    if not safe_label:
+                        continue
+
+                    def _add_labels(tx, _label=safe_label, _name_lowers=name_lowers):
+                        tx.run(
+                            f"""
+                            UNWIND $name_lowers AS name_lower
+                            MATCH (n:Entity {{graph_id: $gid, name_lower: name_lower}})
+                            SET n:`{_label}`
+                            """,
+                            gid=graph_id,
+                            name_lowers=_name_lowers,
+                        )
+                    self._call_with_retry(session.execute_write, _add_labels)
+
+            relation_rows = []
+            for relation in relation_specs:
+                source_uuid = entity_uuid_by_key.get(relation["source_key"])
+                target_uuid = entity_uuid_by_key.get(relation["target_key"])
+                if not source_uuid or not target_uuid:
+                    logger.warning(
+                        "Skipping relation %s->%s: entity not found in extraction results",
+                        relation["source_key"],
+                        relation["target_key"],
+                    )
+                    continue
+                relation_rows.append({
+                    **relation,
+                    "source_uuid": source_uuid,
+                    "target_uuid": target_uuid,
+                })
+
+            if relation_rows:
+                def _create_relations(tx):
+                    tx.run(
+                        """
+                        UNWIND $rows AS row
+                        MATCH (src:Entity {uuid: row.source_uuid})
+                        MATCH (tgt:Entity {uuid: row.target_uuid})
+                        CREATE (src)-[r:RELATION {
+                            uuid: row.uuid,
+                            graph_id: row.graph_id,
+                            name: row.name,
+                            fact: row.fact,
+                            fact_embedding: row.fact_embedding,
+                            attributes_json: '{}',
+                            episode_ids: [row.episode_id],
+                            case_id: row.case_id,
+                            case_version_id: row.case_version_id,
+                            document_id: row.document_id,
+                            filename: row.filename,
+                            document_type: row.document_type,
+                            chunk_index: row.chunk_index,
+                            page: row.page,
+                            paragraph: row.paragraph,
+                            created_at: row.created_at,
+                            valid_at: null,
+                            invalid_at: null,
+                            expired_at: null
+                        }]->(tgt)
+                        """,
+                        rows=relation_rows,
+                    )
+                self._call_with_retry(session.execute_write, _create_relations)
+
+        if profile is not None:
+            profile["neo4j_write_seconds"] = profile.get("neo4j_write_seconds", 0.0) + (
+                time.perf_counter() - write_start
+            )
+
+        return [row["uuid"] for row in episode_rows]
 
     def add_agent_memories(self, graph_id: str, memories: List[Dict[str, Any]]) -> List[str]:
         """Write forecast/simulation memories as searchable Neo4j Entity nodes."""
@@ -1231,6 +1510,16 @@ class Neo4jStorage(GraphStorage):
             "source_node_uuid": source_uuid,
             "target_node_uuid": target_uuid,
             "attributes": attributes,
+            "provenance": {
+                "case_id": props.get("case_id"),
+                "version_id": props.get("case_version_id"),
+                "document_id": props.get("document_id"),
+                "filename": props.get("filename"),
+                "document_type": props.get("document_type"),
+                "chunk_index": props.get("chunk_index"),
+                "page": props.get("page"),
+                "paragraph": props.get("paragraph"),
+            },
             "created_at": props.get("created_at"),
             "valid_at": props.get("valid_at"),
             "invalid_at": props.get("invalid_at"),

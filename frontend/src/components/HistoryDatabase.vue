@@ -151,6 +151,12 @@
             </div>
 
             <!-- Navigation buttons -->
+            <div class="phase-status-grid">
+              <div class="phase-status" :class="phaseStatusClass('graph')">Graph: {{ phaseStatusLabel('graph') }}</div>
+              <div class="phase-status" :class="phaseStatusClass('setup')">Setup: {{ phaseStatusLabel('setup') }}</div>
+              <div class="phase-status" :class="phaseStatusClass('simulation')">Simulation: {{ phaseStatusLabel('simulation') }}</div>
+              <div class="phase-status" :class="phaseStatusClass('report')">Report: {{ phaseStatusLabel('report') }}</div>
+            </div>
             <div class="modal-actions">
               <button
                 class="modal-btn btn-project"
@@ -170,6 +176,15 @@
                 <span class="btn-text">Environment Setup</span>
               </button>
               <button
+                class="modal-btn btn-run"
+                @click="goToSimulationRun"
+                :disabled="!selectedProject.simulation_id"
+              >
+                <span class="btn-step">Step3</span>
+                <span class="btn-icon">◇</span>
+                <span class="btn-text">Simulation Run</span>
+              </button>
+              <button
                 class="modal-btn btn-report"
                 @click="goToReport"
                 :disabled="!selectedProject.report_id"
@@ -181,7 +196,7 @@
             </div>
             <!-- Playback unavailable notice -->
             <div class="modal-playback-hint">
-              <span class="hint-text">Step3 "Start Simulation" and Step5 "Deep Interaction" must be launched during execution and do not support history playback</span>
+              <span class="hint-text">{{ selectedProject.report_id ? 'Open the report to continue analysis, retry failed sections, or enter deep interaction.' : 'No report has been completed yet. Open Step3 to continue simulation or Step4 after a report starts.' }}</span>
             </div>
           </div>
         </div>
@@ -423,6 +438,17 @@ const goToSimulation = () => {
   }
 }
 
+// Navigate to Simulation Run page (Step3)
+const goToSimulationRun = () => {
+  if (selectedProject.value?.simulation_id) {
+    router.push({
+      name: 'SimulationRun',
+      params: { simulationId: selectedProject.value.simulation_id }
+    })
+    closeModal()
+  }
+}
+
 // Navigate to Analysis Report page (Report)
 const goToReport = () => {
   if (selectedProject.value?.report_id) {
@@ -432,6 +458,39 @@ const goToReport = () => {
     })
     closeModal()
   }
+}
+
+const isSimulationComplete = (simulation) => {
+  const total = simulation?.total_rounds || 0
+  const current = simulation?.current_round || 0
+  return total > 0 && current >= total
+}
+
+const phaseStatusLabel = (phase) => {
+  const sim = selectedProject.value || {}
+  if (phase === 'graph') return sim.project_id ? 'Ready' : 'Missing'
+  if (phase === 'setup') return sim.simulation_id ? 'Ready' : 'Missing'
+  if (phase === 'simulation') {
+    if (isSimulationComplete(sim)) return 'Complete'
+    if ((sim.current_round || 0) > 0) return 'In progress'
+    return 'Not run'
+  }
+  if (phase === 'report') {
+    if (!sim.report_id) return 'Not started'
+    if (sim.report_status === 'completed') return 'Complete'
+    if (sim.report_status === 'needs_review') return 'Needs review'
+    if (sim.report_status === 'failed') return 'Failed'
+    return sim.report_status || 'In progress'
+  }
+  return '-'
+}
+
+const phaseStatusClass = (phase) => {
+  const label = phaseStatusLabel(phase).toLowerCase()
+  if (label.includes('complete') || label.includes('ready')) return 'phase-ok'
+  if (label.includes('progress') || label.includes('review')) return 'phase-warn'
+  if (label.includes('failed') || label.includes('missing')) return 'phase-error'
+  return 'phase-idle'
 }
 
 // Load history projects
@@ -1256,13 +1315,14 @@ onUnmounted(() => {
 /* Navigation buttons */
 .modal-actions {
   display: flex;
+  flex-wrap: wrap;
   gap: 16px;
   padding: 20px 32px;
   background: #FFFFFF;
 }
 
 .modal-btn {
-  flex: 1;
+  flex: 1 1 120px;
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -1314,6 +1374,7 @@ onUnmounted(() => {
 
 .modal-btn.btn-project .btn-icon { color: #3B82F6; }
 .modal-btn.btn-simulation .btn-icon { color: #F59E0B; }
+.modal-btn.btn-run .btn-icon { color: #6366F1; }
 .modal-btn.btn-report .btn-icon { color: #10B981; }
 
 .modal-btn:hover:not(:disabled) .btn-text {
@@ -1336,5 +1397,49 @@ onUnmounted(() => {
   letter-spacing: 0.3px;
   text-align: center;
   line-height: 1.5;
+}
+
+.phase-status-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+  padding: 18px 32px 0;
+  background: #FFFFFF;
+}
+
+.phase-status {
+  border: 1px solid #E5E7EB;
+  border-radius: 6px;
+  padding: 8px 10px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.62rem;
+  line-height: 1.35;
+  color: #4B5563;
+  background: #F9FAFB;
+  text-align: center;
+}
+
+.phase-status.phase-ok {
+  color: #047857;
+  border-color: #A7F3D0;
+  background: #ECFDF5;
+}
+
+.phase-status.phase-warn {
+  color: #B45309;
+  border-color: #FCD34D;
+  background: #FFFBEB;
+}
+
+.phase-status.phase-error {
+  color: #B91C1C;
+  border-color: #FECACA;
+  background: #FEF2F2;
+}
+
+@media (max-width: 720px) {
+  .phase-status-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
 }
 </style>

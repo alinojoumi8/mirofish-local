@@ -22,6 +22,7 @@ class FakeResponse:
 
 def test_ollama_auto_pulls_missing_model_and_returns_768d(monkeypatch):
     calls = []
+    monkeypatch.setattr("app.storage.embedding_service.Config.GRAPH_EMBEDDING_CACHE_ENABLED", False)
 
     def fake_get(url, timeout):
         calls.append(("get", url))
@@ -43,6 +44,7 @@ def test_ollama_auto_pulls_missing_model_and_returns_768d(monkeypatch):
 
 def test_ollama_tagless_model_matches_latest_tag(monkeypatch):
     calls = []
+    monkeypatch.setattr("app.storage.embedding_service.Config.GRAPH_EMBEDDING_CACHE_ENABLED", False)
 
     def fake_get(url, timeout):
         return FakeResponse({"models": [{"name": "nomic-embed-text:latest"}]})
@@ -61,6 +63,7 @@ def test_ollama_tagless_model_matches_latest_tag(monkeypatch):
 
 def test_gemini_batch_payload_uses_768_dimensions_and_task_type(monkeypatch):
     captured = {}
+    monkeypatch.setattr("app.storage.embedding_service.Config.GRAPH_EMBEDDING_CACHE_ENABLED", False)
 
     def fake_post(url, json, headers=None, timeout=30):
         captured["url"] = url

@@ -27,6 +27,7 @@ from .forecasting import (
     domain_guidance_for_forecast,
     normalize_forecast_settings,
 )
+from ..models.case import normalize_prediction_settings
 
 logger = get_logger('mirofish.simulation_config')
 
@@ -180,6 +181,9 @@ class SimulationParameters:
     scenario_pack: str = "baseline_adverse_favorable"
     ensemble_runs: int = 5
     memory_mode: str = "practical"
+    prediction_settings: Dict[str, Any] = field(default_factory=dict)
+    report_mode: str = "litigation_case"
+    report_depth: str = "standard"
 
     # LLM configuration
     llm_model: str = ""
@@ -208,6 +212,9 @@ class SimulationParameters:
             "scenario_pack": self.scenario_pack,
             "ensemble_runs": self.ensemble_runs,
             "memory_mode": self.memory_mode,
+            "prediction_settings": self.prediction_settings,
+            "report_mode": self.report_mode,
+            "report_depth": self.report_depth,
             "llm_model": self.llm_model,
             "llm_base_url": self.llm_base_url,
             "generated_at": self.generated_at,
@@ -273,6 +280,7 @@ class SimulationConfigGenerator:
         enable_twitter: bool = True,
         enable_reddit: bool = True,
         forecast_settings: Optional[Dict[str, Any]] = None,
+        prediction_settings: Optional[Dict[str, Any]] = None,
         progress_callback: Optional[Callable[[int, int, str], None]] = None,
     ) -> SimulationParameters:
         """
@@ -298,6 +306,7 @@ class SimulationConfigGenerator:
             entity_types=[e.get_entity_type() or "Unknown" for e in entities],
         )
         forecast_dict = forecast.to_dict()
+        prediction = normalize_prediction_settings(prediction_settings)
         logger.info(
             "Starting intelligent simulation configuration generation: "
             f"simulation_id={simulation_id}, entities={len(entities)}, forecast_mode={forecast.forecast_mode}"
@@ -330,6 +339,7 @@ class SimulationConfigGenerator:
         num_entities = len(entities)
         time_config_result = self._generate_time_config(context, num_entities, forecast_dict)
         time_config = self._parse_time_config(time_config_result, num_entities, forecast_dict)
+        time_config = self._apply_prediction_time_controls(time_config, prediction)
         reasoning_parts.append(f"Time config: {time_config_result.get('reasoning', 'Success')}")
 
         # ========== Step 2: Generate event configuration ==========
@@ -409,6 +419,9 @@ class SimulationConfigGenerator:
             scenario_pack=forecast.scenario_pack,
             ensemble_runs=forecast.ensemble_runs,
             memory_mode=forecast.memory_mode,
+            prediction_settings=prediction,
+            report_mode=prediction.get("report_mode", "litigation_case"),
+            report_depth=prediction.get("report_depth", "standard"),
             llm_model=self.model_name,
             llm_base_url=self.base_url,
             generation_reasoning=" | ".join(reasoning_parts)
@@ -703,6 +716,23 @@ Field description:
             work_activity_multiplier=0.7,
             peak_activity_multiplier=1.5
         )
+
+    def _apply_prediction_time_controls(
+        self,
+        time_config: TimeSimulationConfig,
+        prediction_settings: Dict[str, Any],
+    ) -> TimeSimulationConfig:
+        """Apply explicit user prediction controls after LLM/default generation."""
+        if prediction_settings.get("simulation_duration"):
+            time_config.total_simulation_hours = int(prediction_settings["simulation_duration"])
+        if prediction_settings.get("minutes_per_round"):
+            time_config.minutes_per_round = int(prediction_settings["minutes_per_round"])
+        active = prediction_settings.get("active_agents_per_round") or prediction_settings.get("active_agents_per_hour")
+        if active:
+            active = int(active)
+            time_config.agents_per_hour_min = max(1, min(time_config.agents_per_hour_min, active))
+            time_config.agents_per_hour_max = max(time_config.agents_per_hour_min, active)
+        return time_config
     
     def _generate_event_config(
         self,
@@ -1140,4 +1170,3 @@ Return JSON format (no markdown):
                 "influence_weight": 1.0
             }
     
-

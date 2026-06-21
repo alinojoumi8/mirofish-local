@@ -18,8 +18,15 @@ from ..services.text_processor import TextProcessor
 from ..storage.extraction_cache import ExtractionCache
 from ..utils.file_parser import FileParser
 from ..utils.logger import get_logger
+from ..utils.timing import PhaseTimer
 from ..models.task import TaskManager, TaskStatus
 from ..models.project import ProjectManager, ProjectStatus
+from ..models.case import (
+    CaseManager,
+    classify_document_type,
+    normalize_graph_build_settings,
+    normalize_prediction_settings,
+)
 
 # Get logger
 logger = get_logger('mirofish.api')
@@ -96,6 +103,172 @@ def delete_project(project_id: str):
     })
 
 
+# ============== Case Management Interface ==============
+
+@graph_bp.route('/case/create', methods=['POST'])
+def create_case():
+    """Create a top-level litigation case."""
+    try:
+        data = request.get_json(silent=True) or {}
+        name = data.get("name") or data.get("case_name") or "Untitled Case"
+        simulation_requirement = data.get("simulation_requirement", "")
+        case = CaseManager.create_case(
+            name=name,
+            simulation_requirement=simulation_requirement,
+            tags=data.get("tags") or [],
+        )
+        return jsonify({"success": True, "data": case.to_dict()})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e), "traceback": traceback.format_exc()}), 500
+
+
+@graph_bp.route('/case/list', methods=['GET'])
+def list_cases():
+    """List cases."""
+    try:
+        limit = request.args.get('limit', 50, type=int)
+        cases = CaseManager.list_cases(limit=limit)
+        return jsonify({
+            "success": True,
+            "data": [case.to_dict() for case in cases],
+            "count": len(cases),
+        })
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e), "traceback": traceback.format_exc()}), 500
+
+
+@graph_bp.route('/case/<case_id>', methods=['GET'])
+def get_case(case_id: str):
+    """Get case details."""
+    case = CaseManager.get_case(case_id)
+    if not case:
+        return jsonify({"success": False, "error": f"Case does not exist: {case_id}"}), 404
+    return jsonify({"success": True, "data": case.to_dict()})
+
+
+@graph_bp.route('/case/<case_id>/versions', methods=['GET'])
+def list_case_versions(case_id: str):
+    """List versions for a case."""
+    case = CaseManager.get_case(case_id)
+    if not case:
+        return jsonify({"success": False, "error": f"Case does not exist: {case_id}"}), 404
+    return jsonify({
+        "success": True,
+        "data": [version.to_dict() for version in case.versions],
+        "count": len(case.versions),
+    })
+
+
+@graph_bp.route('/case/<case_id>/compare', methods=['POST'])
+def compare_case_versions(case_id: str):
+    """Compare prediction snapshots across two case versions."""
+    try:
+        data = request.get_json(silent=True) or {}
+        from_version_id = data.get("from_version_id")
+        to_version_id = data.get("to_version_id")
+        if not from_version_id or not to_version_id:
+            return jsonify({
+                "success": False,
+                "error": "Please provide from_version_id and to_version_id",
+            }), 400
+        return jsonify({
+            "success": True,
+            "data": CaseManager.compare_prediction_versions(case_id, from_version_id, to_version_id),
+        })
+    except ValueError as e:
+        return jsonify({"success": False, "error": str(e)}), 404
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e), "traceback": traceback.format_exc()}), 500
+
+
+@graph_bp.route('/case/<case_id>/documents', methods=['POST'])
+def add_documents_to_case(case_id: str):
+    """
+    Add a document batch to an existing case and create a new case version.
+
+    This endpoint records the version and extracted text. The existing
+    ontology/generate endpoint remains the full analyze-and-build entry point.
+    """
+    try:
+        case = CaseManager.get_case(case_id)
+        if not case:
+            return jsonify({"success": False, "error": f"Case does not exist: {case_id}"}), 404
+
+        uploaded_files = request.files.getlist('files')
+        if not uploaded_files or all(not f.filename for f in uploaded_files):
+            return jsonify({"success": False, "error": "Please upload at least one document file"}), 400
+
+        project = ProjectManager.create_project(name=request.form.get("project_name", case.name))
+        project.case_id = case_id
+        project.simulation_requirement = request.form.get("simulation_requirement") or case.simulation_requirement
+
+        document_texts = []
+        all_text = ""
+        for file in uploaded_files:
+            if not file or not file.filename or not allowed_file(file.filename):
+                continue
+            file_info = ProjectManager.save_file_to_project(project.project_id, file, file.filename)
+            text = TextProcessor.preprocess_text(FileParser.extract_text(file_info["path"]))
+            document_texts.append({
+                "filename": file_info["original_filename"],
+                "path": file_info["path"],
+                "size": file_info["size"],
+                "text": text,
+                "document_type": classify_document_type(file_info["original_filename"], text).value,
+            })
+            all_text += f"\n\n=== {file_info['original_filename']} ===\n{text}"
+
+        if not document_texts:
+            ProjectManager.delete_project(project.project_id)
+            return jsonify({"success": False, "error": "No documents successfully processed"}), 400
+
+        version = CaseManager.create_version(
+            case_id=case_id,
+            project_id=project.project_id,
+            documents=document_texts,
+            build_settings=normalize_graph_build_settings(request.form.to_dict()),
+            prediction_settings=normalize_prediction_settings(request.form.to_dict()),
+        )
+
+        stored_docs = []
+        for raw, case_doc in zip(document_texts, version.documents):
+            stored_docs.append({
+                **raw,
+                "document_id": case_doc.document_id,
+                "case_id": case_id,
+                "version_id": version.version_id,
+                "hash": case_doc.hash,
+            })
+
+        project.documents = [
+            {key: value for key, value in item.items() if key != "text"}
+            for item in stored_docs
+        ]
+        project.files = [
+            {"filename": item["filename"], "path": item.get("path"), "size": item.get("size", 0)}
+            for item in stored_docs
+        ]
+        project.total_text_length = len(all_text)
+        project.case_version_id = version.version_id
+        project.case_version_number = version.version_number
+        project.graph_build_settings = version.build_settings
+        project.prediction_settings = version.prediction_settings
+        ProjectManager.save_extracted_text(project.project_id, all_text)
+        ProjectManager.save_document_texts(project.project_id, stored_docs)
+        ProjectManager.save_project(project)
+
+        return jsonify({
+            "success": True,
+            "data": {
+                "case": CaseManager.get_case(case_id).to_dict(),
+                "version": version.to_dict(),
+                "project": project.to_dict(),
+            },
+        })
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e), "traceback": traceback.format_exc()}), 500
+
+
 @graph_bp.route('/project/<project_id>/reset', methods=['POST'])
 def reset_project(project_id: str):
     """
@@ -159,7 +332,7 @@ def generate_ontology():
     """
     try:
         logger.info("=== Starting ontology generation ===")
-        phase_started = time.perf_counter()
+        timing = PhaseTimer("ontology_generation")
         phase_profile = {
             "pdf_extraction_seconds": 0.0,
             "ontology_seconds": 0.0,
@@ -169,6 +342,7 @@ def generate_ontology():
         # Get parameters
         simulation_requirement = request.form.get('simulation_requirement', '')
         project_name = request.form.get('project_name', 'Unnamed Project')
+        case_id = request.form.get('case_id')
         additional_context = request.form.get('additional_context', '')
 
         logger.debug(f"Project name: {project_name}")
@@ -188,71 +362,141 @@ def generate_ontology():
                 "error": "Please upload at least one document file"
             }), 400
 
+        # Create or load case
+        case = CaseManager.get_case(case_id) if case_id else None
+        if case_id and not case:
+            return jsonify({
+                "success": False,
+                "error": f"Case does not exist: {case_id}"
+            }), 404
+        if not case:
+            case = CaseManager.create_case(
+                name=project_name,
+                simulation_requirement=simulation_requirement,
+            )
+        case_id = case.case_id
+
         # Create project
         project = ProjectManager.create_project(name=project_name)
+        project.case_id = case_id
         project.simulation_requirement = simulation_requirement
         logger.info(f"Project created: {project.project_id}")
         
         # Save files and extract text
-        document_texts = []
+        ontology_texts = []
+        document_payloads = []
         all_text = ""
 
-        extraction_started = time.perf_counter()
-        for file in uploaded_files:
-            if file and file.filename and allowed_file(file.filename):
-                # Save file to project directory
-                file_info = ProjectManager.save_file_to_project(
-                    project.project_id,
-                    file,
-                    file.filename
-                )
-                project.files.append({
-                    "filename": file_info["original_filename"],
-                    "size": file_info["size"]
-                })
+        with timing.time("document_extraction", label="Save files and extract text", metadata={"file_count": len(uploaded_files)}):
+            for file in uploaded_files:
+                if file and file.filename and allowed_file(file.filename):
+                    # Save file to project directory
+                    file_info = ProjectManager.save_file_to_project(
+                        project.project_id,
+                        file,
+                        file.filename
+                    )
+                    # Extract text
+                    text = FileParser.extract_text(file_info["path"])
+                    text = TextProcessor.preprocess_text(text)
+                    document_type = classify_document_type(file_info["original_filename"], text).value
+                    ontology_texts.append(text)
+                    document_payloads.append({
+                        "filename": file_info["original_filename"],
+                        "path": file_info["path"],
+                        "size": file_info["size"],
+                        "text": text,
+                        "document_type": document_type,
+                    })
+                    all_text += f"\n\n=== {file_info['original_filename']} ===\n{text}"
+        phase_profile["pdf_extraction_seconds"] = timing.snapshot()["phase_totals"].get("document_extraction", 0.0)
 
-                # Extract text
-                text = FileParser.extract_text(file_info["path"])
-                text = TextProcessor.preprocess_text(text)
-                document_texts.append(text)
-                all_text += f"\n\n=== {file_info['original_filename']} ===\n{text}"
-        phase_profile["pdf_extraction_seconds"] = round(time.perf_counter() - extraction_started, 4)
-
-        if not document_texts:
+        if not ontology_texts:
             ProjectManager.delete_project(project.project_id)
             return jsonify({
                 "success": False,
                 "error": "No documents successfully processed. Please check file format"
             }), 400
 
+        with timing.time("case_version", label="Create case version", metadata={"document_count": len(document_payloads)}):
+            version = CaseManager.create_version(
+                case_id=case_id,
+                project_id=project.project_id,
+                documents=document_payloads,
+                build_settings=normalize_graph_build_settings(request.form.to_dict()),
+                prediction_settings=normalize_prediction_settings(request.form.to_dict()),
+            )
+        stored_documents = []
+        for raw, case_doc in zip(document_payloads, version.documents):
+            stored_documents.append({
+                **raw,
+                "document_id": case_doc.document_id,
+                "case_id": case_id,
+                "version_id": version.version_id,
+                "hash": case_doc.hash,
+            })
+        project.case_version_id = version.version_id
+        project.case_version_number = version.version_number
+        project.documents = [
+            {key: value for key, value in item.items() if key != "text"}
+            for item in stored_documents
+        ]
+        project.files = [
+            {"filename": item["filename"], "path": item.get("path"), "size": item.get("size", 0)}
+            for item in stored_documents
+        ]
+        project.graph_build_settings = version.build_settings
+        project.prediction_settings = version.prediction_settings
+
         # Save extracted text
         project.total_text_length = len(all_text)
-        ProjectManager.save_extracted_text(project.project_id, all_text)
+        with timing.time("persist_documents", label="Persist extracted document text"):
+            ProjectManager.save_extracted_text(project.project_id, all_text)
+            ProjectManager.save_document_texts(project.project_id, stored_documents)
         logger.info(f"Text extraction completed, total {len(all_text)} characters")
 
         # Generate ontology
         logger.info("Calling LLM to generate ontology definition...")
         generator = OntologyGenerator()
-        ontology_started = time.perf_counter()
-        ontology = generator.generate(
-            document_texts=document_texts,
-            simulation_requirement=simulation_requirement,
-            additional_context=additional_context if additional_context else None
-        )
-        phase_profile["ontology_seconds"] = round(time.perf_counter() - ontology_started, 4)
-        phase_profile["total_seconds"] = round(time.perf_counter() - phase_started, 4)
+        with timing.time("ontology_llm", label="Generate ontology with LLM", metadata={"document_count": len(ontology_texts)}):
+            ontology = generator.generate(
+                document_texts=ontology_texts,
+                simulation_requirement=simulation_requirement,
+                additional_context=additional_context if additional_context else None
+            )
+        phase_profile["ontology_seconds"] = timing.snapshot()["phase_totals"].get("ontology_llm", 0.0)
 
         # Save ontology to project
         entity_count = len(ontology.get("entity_types", []))
         edge_count = len(ontology.get("edge_types", []))
         logger.info(f"Ontology generation completed: {entity_count} entity types, {edge_count} relation types")
         
-        project.ontology = {
-            "entity_types": ontology.get("entity_types", []),
-            "edge_types": ontology.get("edge_types", [])
-        }
-        project.analysis_summary = ontology.get("analysis_summary", "")
-        project.status = ProjectStatus.ONTOLOGY_GENERATED
+        with timing.time("persist_ontology", label="Persist ontology metadata"):
+            project.ontology = {
+                "entity_types": ontology.get("entity_types", []),
+                "edge_types": ontology.get("edge_types", [])
+            }
+            project.analysis_summary = ontology.get("analysis_summary", "")
+            project.status = ProjectStatus.ONTOLOGY_GENERATED
+            ProjectManager.save_project(project)
+            CaseManager.update_version(
+                project.case_id,
+                project.case_version_id,
+                status="ontology_generated",
+                prediction_settings=project.prediction_settings,
+                build_settings=project.graph_build_settings,
+            )
+        timing_summary = timing.complete(metadata={
+            "project_id": project.project_id,
+            "case_id": project.case_id,
+            "case_version_id": project.case_version_id,
+            "document_count": len(stored_documents),
+            "entity_type_count": entity_count,
+            "edge_type_count": edge_count,
+        })
+        phase_profile["total_seconds"] = timing_summary["total_seconds"]
+        phase_profile["timing"] = timing_summary
+        project.timings = {**(project.timings or {}), "ontology_generation": timing_summary}
         ProjectManager.save_project(project)
         logger.info(f"=== Ontology generation completed === Project ID: {project.project_id}")
         
@@ -261,9 +505,13 @@ def generate_ontology():
             "data": {
                 "project_id": project.project_id,
                 "project_name": project.name,
+                "case_id": project.case_id,
+                "case_version_id": project.case_version_id,
+                "case_version_number": project.case_version_number,
                 "ontology": project.ontology,
                 "analysis_summary": project.analysis_summary,
                 "files": project.files,
+                "documents": project.documents,
                 "total_text_length": project.total_text_length,
                 "profile": phase_profile,
             }
@@ -349,29 +597,19 @@ def build_graph():
 
         # Get configuration
         graph_name = data.get('graph_name', project.name or 'MiroFish Graph')
-        legacy_chunk_size = 500
-        legacy_chunk_overlap = 50
-        chunk_size = data.get('chunk_size')
-        if chunk_size is None:
-            chunk_size = (
-                Config.DEFAULT_CHUNK_SIZE
-                if not project.chunk_size or project.chunk_size == legacy_chunk_size
-                else project.chunk_size
-            )
-        chunk_overlap = data.get('chunk_overlap')
-        if chunk_overlap is None:
-            chunk_overlap = (
-                Config.DEFAULT_CHUNK_OVERLAP
-                if project.chunk_overlap is None or project.chunk_overlap == legacy_chunk_overlap
-                else project.chunk_overlap
-            )
-        chunk_size = max(1, int(chunk_size))
-        chunk_overlap = max(0, min(int(chunk_overlap), chunk_size - 1))
-        batch_size = max(1, int(data.get('batch_size', Config.GRAPH_BUILD_BATCH_SIZE)))
+        request_settings = {**(project.graph_build_settings or {}), **data}
+        build_settings = GraphBuilderService.resolve_build_settings(request_settings)
+        chunk_size = build_settings["chunk_size"]
+        chunk_overlap = build_settings["chunk_overlap"]
+        batch_size = build_settings["batch_size"]
+        build_mode = build_settings["build_mode"]
+        llm_concurrency_override = build_settings.get("llm_concurrency")
+        incremental_mode = bool(build_settings.get("incremental"))
 
         # Update project configuration
         project.chunk_size = chunk_size
         project.chunk_overlap = chunk_overlap
+        project.graph_build_settings = build_settings
 
         # Get extracted text
         text = ProjectManager.get_extracted_text(project_id)
@@ -380,6 +618,12 @@ def build_graph():
                 "success": False,
                 "error": "Extracted text not found"
             }), 400
+        document_texts = ProjectManager.get_document_texts(project_id)
+        if document_texts:
+            for document in document_texts:
+                document.setdefault("case_id", project.case_id)
+                document.setdefault("version_id", project.case_version_id)
+                document.setdefault("case_version_id", project.case_version_id)
 
         # Get ontology
         ontology = project.ontology
@@ -391,6 +635,14 @@ def build_graph():
 
         # Get storage in request context (background thread cannot access current_app)
         storage = _get_storage()
+        use_existing_graph = bool(incremental_mode and project.graph_id and not force)
+        built_hashes = set(build_settings.get("built_document_hashes") or [])
+        documents_for_build = document_texts
+        if use_existing_graph and document_texts:
+            documents_for_build = [
+                document for document in document_texts
+                if document.get("hash") not in built_hashes
+            ]
 
         # Create async task
         task_manager = TaskManager()
@@ -406,6 +658,13 @@ def build_graph():
         def build_task():
             build_logger = get_logger('mirofish.build')
             build_started = time.perf_counter()
+            timing = PhaseTimer("graph_build", metadata={
+                "project_id": project_id,
+                "task_id": task_id,
+                "graph_name": graph_name,
+                "build_preset": build_settings.get("build_preset"),
+                "build_mode": build_mode,
+            })
             build_profile = {
                 "chunking_seconds": 0.0,
                 "graph_create_seconds": 0.0,
@@ -425,45 +684,144 @@ def build_graph():
                 )
 
                 # Create graph builder service (storage passed from outer closure)
-                builder = GraphBuilderService(storage=storage)
+                with timing.time("initialize_service", label="Initialize graph builder"):
+                    builder = GraphBuilderService(storage=storage)
 
-                # Chunk text
+                # Chunk text, preserving document boundaries when available.
                 task_manager.update_task(
                     task_id,
                     message="Chunking text...",
                     progress=5
                 )
-                chunk_started = time.perf_counter()
-                chunks = TextProcessor.split_text(
-                    text,
-                    chunk_size=chunk_size,
-                    overlap=chunk_overlap
-                )
-                build_profile["chunking_seconds"] = round(time.perf_counter() - chunk_started, 4)
+                per_document_profile = []
+                chunk_metadata = None
+                with timing.time("chunking", label="Split documents into chunks", metadata={"document_count": len(documents_for_build)}):
+                    if documents_for_build:
+                        chunk_rows = GraphBuilderService.split_documents_with_provenance(
+                            documents_for_build,
+                            chunk_size=chunk_size,
+                            chunk_overlap=chunk_overlap,
+                        )
+                        chunks = [row["text"] for row in chunk_rows]
+                        chunk_metadata = [row["metadata"] for row in chunk_rows]
+                        for document in documents_for_build:
+                            per_document_profile.append({
+                                "document_id": document.get("document_id"),
+                                "filename": document.get("filename"),
+                                "document_type": document.get("document_type"),
+                                "hash": document.get("hash"),
+                                "text_length": len(document.get("text") or ""),
+                                "chunk_count": sum(
+                                    1 for row in chunk_rows
+                                    if row["metadata"].get("document_id") == document.get("document_id")
+                                ),
+                                "cache_status": "new" if document.get("hash") not in built_hashes else "reused",
+                            })
+                    else:
+                        chunks = TextProcessor.split_text(
+                            text,
+                            chunk_size=chunk_size,
+                            overlap=chunk_overlap
+                        )
+                build_profile["chunking_seconds"] = timing.snapshot()["phase_totals"].get("chunking", 0.0)
+                build_profile["per_document"] = per_document_profile
                 total_chunks = len(chunks)
-                file_hash = ExtractionCache.hash_text(text)
+                selected_text = "\n".join(chunks) if chunks else text
+                file_hash = ExtractionCache.hash_text(selected_text)
                 ontology_hash = ExtractionCache.hash_ontology(ontology)
                 progress_detail = {
                     "current_chunk": 0,
                     "total_chunks": total_chunks,
+                    "document_count": len(document_texts),
+                    "documents_built": len(documents_for_build),
                     "chunk_size": chunk_size,
                     "chunk_overlap": chunk_overlap,
                     "batch_size": batch_size,
+                    "build_preset": build_settings.get("build_preset"),
+                    "build_mode": build_mode,
+                    "incremental": incremental_mode,
+                    "using_existing_graph": use_existing_graph,
+                    "max_batch_chars": Config.GRAPH_BUILD_MAX_BATCH_CHARS,
+                    "llm_provider": Config.LLM_DEFAULT_PROVIDER,
+                    "llm_model": Config.LLM_MODEL_NAME,
+                    "embedding_provider": Config.EMBEDDING_PROVIDER,
+                    "embedding_model": Config.EMBEDDING_MODEL if Config.EMBEDDING_PROVIDER == "ollama" else Config.GEMINI_EMBEDDING_MODEL,
                     "file_hash": file_hash,
                     "eta_seconds": None,
                     "profile": build_profile,
+                    "timing": timing.snapshot(),
                 }
 
-                # Create graph
+                if use_existing_graph and not chunks:
+                    graph_id = project.graph_id
+                    with timing.time("retrieve_graph_data", label="Retrieve existing graph data"):
+                        graph_data = builder.get_graph_data(graph_id)
+                    quality_summary = {}
+                    with timing.time("graph_quality", label="Summarize graph quality"):
+                        try:
+                            quality_summary = storage.get_graph_quality(graph_id)
+                        except Exception as quality_exc:
+                            build_logger.warning(f"[{task_id}] Graph quality summary unavailable: {quality_exc}")
+                    timing_summary = timing.complete(metadata={
+                        "graph_id": graph_id,
+                        "node_count": graph_data.get("node_count", 0),
+                        "edge_count": graph_data.get("edge_count", 0),
+                        "chunk_count": 0,
+                    })
+                    build_profile["total_seconds"] = timing_summary["total_seconds"]
+                    build_profile["timing"] = timing_summary
+                    project.status = ProjectStatus.GRAPH_COMPLETED
+                    project.graph_build_settings = {
+                        **build_settings,
+                        "built_document_hashes": sorted(built_hashes),
+                        "last_graph_quality": quality_summary,
+                        "last_build_profile": build_profile,
+                        "last_build_timing": timing_summary,
+                    }
+                    project.timings = {**(project.timings or {}), "graph_build": timing_summary}
+                    ProjectManager.save_project(project)
+                    if project.case_id and project.case_version_id:
+                        CaseManager.update_version(
+                            project.case_id,
+                            project.case_version_id,
+                            graph_id=graph_id,
+                            build_profile=build_profile,
+                            graph_quality=quality_summary,
+                            status="graph_completed",
+                        )
+                    task_manager.update_task(
+                        task_id,
+                        status=TaskStatus.COMPLETED,
+                        message="Graph already up to date",
+                        progress=100,
+                        progress_detail={**progress_detail, "profile": build_profile, "graph_quality": quality_summary, "timing": timing_summary},
+                        result={
+                            "project_id": project_id,
+                            "graph_id": graph_id,
+                            "node_count": graph_data.get("node_count", 0),
+                            "edge_count": graph_data.get("edge_count", 0),
+                            "chunk_count": 0,
+                            "graph_quality": quality_summary,
+                            "profile": build_profile,
+                            "timing": timing_summary,
+                            "settings": build_settings,
+                        },
+                    )
+                    return
+
+                # Create or reuse graph
                 task_manager.update_task(
                     task_id,
-                    message=f"Text split into {total_chunks} chunks. Creating Neo4j graph...",
+                    message=(
+                        f"Text split into {total_chunks} chunks. "
+                        f"{'Using existing Neo4j graph' if use_existing_graph else 'Creating Neo4j graph'}..."
+                    ),
                     progress=10,
                     progress_detail=progress_detail
                 )
-                graph_started = time.perf_counter()
-                graph_id = builder.create_graph(name=graph_name)
-                build_profile["graph_create_seconds"] = round(time.perf_counter() - graph_started, 4)
+                with timing.time("create_graph", label="Create or reuse Neo4j graph"):
+                    graph_id = project.graph_id if use_existing_graph else builder.create_graph(name=graph_name)
+                build_profile["graph_create_seconds"] = timing.snapshot()["phase_totals"].get("create_graph", 0.0)
 
                 # Update project graph_id
                 project.graph_id = graph_id
@@ -475,9 +833,9 @@ def build_graph():
                     message="Setting ontology definition...",
                     progress=15
                 )
-                ontology_started = time.perf_counter()
-                builder.set_ontology(graph_id, ontology)
-                build_profile["ontology_seconds"] = round(time.perf_counter() - ontology_started, 4)
+                with timing.time("set_ontology", label="Store ontology on graph"):
+                    builder.set_ontology(graph_id, ontology)
+                build_profile["ontology_seconds"] = timing.snapshot()["phase_totals"].get("set_ontology", 0.0)
                 
                 # Add text (progress_callback signature is (msg, progress_ratio))
                 def add_progress_callback(msg, progress_ratio, detail=None):
@@ -490,6 +848,7 @@ def build_graph():
                         **progress_detail,
                         **(detail or {}),
                         "profile": latest_profile,
+                        "timing": timing.snapshot(),
                     }
                     task_manager.update_task(
                         task_id,
@@ -505,16 +864,19 @@ def build_graph():
                     progress_detail=progress_detail,
                 )
 
-                episode_uuids = builder.add_text_batches(
-                    graph_id,
-                    chunks,
-                    batch_size=batch_size,
-                    progress_callback=add_progress_callback,
-                    cache_context={
-                        "file_hash": file_hash,
-                        "ontology_hash": ontology_hash,
-                    },
-                )
+                with timing.time("extract_and_write", label="Extract entities and write graph", metadata={"chunk_count": total_chunks}):
+                    episode_uuids = builder.add_text_batches(
+                        graph_id,
+                        chunks,
+                        batch_size=batch_size,
+                        progress_callback=add_progress_callback,
+                        cache_context={
+                            "file_hash": file_hash,
+                            "ontology_hash": ontology_hash,
+                        },
+                        llm_concurrency_override=llm_concurrency_override,
+                        chunk_metadata=chunk_metadata,
+                    )
                 build_profile.update({
                     "llm_extraction_seconds": builder.last_build_profile.get("llm_extraction_seconds", 0.0),
                     "embedding_seconds": builder.last_build_profile.get("embedding_seconds", 0.0),
@@ -525,6 +887,7 @@ def build_graph():
                     "llm_concurrency": builder.last_build_profile.get("llm_concurrency"),
                     "total_batches": builder.last_build_profile.get("total_batches"),
                 })
+                build_profile["timing"] = timing.snapshot()
 
                 # Neo4j processing is synchronous, no need to wait
                 task_manager.update_task(
@@ -536,6 +899,7 @@ def build_graph():
                         "current_chunk": total_chunks,
                         "total_chunks": total_chunks,
                         "profile": build_profile,
+                        "timing": timing.snapshot(),
                     },
                 )
 
@@ -549,19 +913,56 @@ def build_graph():
                         "current_chunk": total_chunks,
                         "total_chunks": total_chunks,
                         "profile": build_profile,
+                        "timing": timing.snapshot(),
                     },
                 )
-                graph_data_started = time.perf_counter()
-                graph_data = builder.get_graph_data(graph_id)
-                build_profile["graph_data_seconds"] = round(time.perf_counter() - graph_data_started, 4)
-                build_profile["total_seconds"] = round(time.perf_counter() - build_started, 4)
+                with timing.time("retrieve_graph_data", label="Retrieve graph data"):
+                    graph_data = builder.get_graph_data(graph_id)
+                build_profile["graph_data_seconds"] = timing.snapshot()["phase_totals"].get("retrieve_graph_data", 0.0)
+                quality_summary = {}
+                with timing.time("graph_quality", label="Summarize graph quality"):
+                    try:
+                        quality_summary = storage.get_graph_quality(graph_id)
+                    except Exception as quality_exc:
+                        build_logger.warning(f"[{task_id}] Graph quality summary unavailable: {quality_exc}")
+                node_count = graph_data.get("node_count", 0)
+                edge_count = graph_data.get("edge_count", 0)
+                timing_summary = timing.complete(metadata={
+                    "graph_id": graph_id,
+                    "node_count": node_count,
+                    "edge_count": edge_count,
+                    "chunk_count": total_chunks,
+                    "episode_count": len(episode_uuids),
+                })
+                build_profile["total_seconds"] = timing_summary["total_seconds"]
+                build_profile["timing"] = timing_summary
 
                 # Update project status
                 project.status = ProjectStatus.GRAPH_COMPLETED
+                new_hashes = {document.get("hash") for document in documents_for_build if document.get("hash")}
+                all_built_hashes = sorted((built_hashes | new_hashes) or {
+                    document.get("hash") for document in document_texts if document.get("hash")
+                })
+                project.graph_build_settings = {
+                    **build_settings,
+                    "built_document_hashes": all_built_hashes,
+                    "last_graph_quality": quality_summary,
+                    "last_build_profile": build_profile,
+                    "last_build_timing": timing_summary,
+                }
+                project.timings = {**(project.timings or {}), "graph_build": timing_summary}
                 ProjectManager.save_project(project)
+                if project.case_id and project.case_version_id:
+                    CaseManager.update_version(
+                        project.case_id,
+                        project.case_version_id,
+                        graph_id=graph_id,
+                        build_profile=build_profile,
+                        graph_quality=quality_summary,
+                        build_settings=project.graph_build_settings,
+                        status="graph_completed",
+                    )
 
-                node_count = graph_data.get("node_count", 0)
-                edge_count = graph_data.get("edge_count", 0)
                 build_logger.info(f"[{task_id}] Graph build completed: graph_id={graph_id}, nodes={node_count}, edges={edge_count}")
 
                 # Complete
@@ -575,6 +976,8 @@ def build_graph():
                         "current_chunk": total_chunks,
                         "total_chunks": total_chunks,
                         "profile": build_profile,
+                        "graph_quality": quality_summary,
+                        "timing": timing_summary,
                     },
                     result={
                         "project_id": project_id,
@@ -585,7 +988,14 @@ def build_graph():
                         "chunk_size": chunk_size,
                         "chunk_overlap": chunk_overlap,
                         "batch_size": batch_size,
+                        "build_mode": build_mode,
+                        "llm_provider": Config.LLM_DEFAULT_PROVIDER,
+                        "llm_model": Config.LLM_MODEL_NAME,
+                        "embedding_provider": Config.EMBEDDING_PROVIDER,
                         "profile": build_profile,
+                        "graph_quality": quality_summary,
+                        "timing": timing_summary,
+                        "settings": project.graph_build_settings,
                     }
                 )
 
@@ -596,13 +1006,25 @@ def build_graph():
 
                 project.status = ProjectStatus.FAILED
                 project.error = str(e)
+                timing_summary = timing.fail(str(e))
+                build_profile["timing"] = timing_summary
+                build_profile["total_seconds"] = timing_summary["total_seconds"]
+                project.timings = {**(project.timings or {}), "graph_build": timing_summary}
                 ProjectManager.save_project(project)
+                if project.case_id and project.case_version_id:
+                    CaseManager.update_version(
+                        project.case_id,
+                        project.case_version_id,
+                        status="failed",
+                        build_profile=build_profile,
+                    )
 
                 task_manager.update_task(
                     task_id,
                     status=TaskStatus.FAILED,
                     message=f"Build failed: {str(e)}",
-                    error=traceback.format_exc()
+                    error=traceback.format_exc(),
+                    progress_detail={"profile": build_profile, "timing": timing_summary},
                 )
 
         # Start background thread
@@ -613,7 +1035,10 @@ def build_graph():
             "success": True,
             "data": {
                 "project_id": project_id,
+                "case_id": project.case_id,
+                "case_version_id": project.case_version_id,
                 "task_id": task_id,
+                "settings": build_settings,
                 "message": "Graph build task started. Query progress via /task/{task_id}"
             }
         })

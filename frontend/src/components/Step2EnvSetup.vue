@@ -60,6 +60,10 @@
           <p class="description">
             Combined with context，Automatically invoke tools to organize entities and relationships from knowledge graph，Initialize simulation individuals，and give them unique behaviors and memories based on reality seed
           </p>
+          <div v-if="prepareTiming?.total_seconds !== undefined" class="forecast-settings-summary">
+            <span>Total {{ formatDuration(prepareTiming.total_seconds) }}</span>
+            <span v-if="activePrepareTimingPhase">Now {{ activePrepareTimingPhase }}</span>
+          </div>
 
           <div class="forecast-controls-panel">
             <div class="forecast-control-header">
@@ -89,6 +93,62 @@
                 <select v-model="memoryMode" :disabled="forecastControlsLocked">
                   <option value="practical">Practical</option>
                   <option value="off">Off</option>
+                  <option value="full">Full</option>
+                </select>
+              </label>
+            </div>
+            <div class="prediction-settings-grid">
+              <label class="forecast-field">
+                <span class="forecast-label">Preset</span>
+                <select v-model="predictionPreset" :disabled="forecastControlsLocked">
+                  <option value="quick_legal_read">Quick legal read</option>
+                  <option value="standard_litigation_prediction">Standard litigation</option>
+                  <option value="deep_adversarial_run">Deep adversarial</option>
+                </select>
+              </label>
+              <label class="forecast-field">
+                <span class="forecast-label">Agents</span>
+                <input v-model.number="agentCount" :disabled="forecastControlsLocked" type="number" min="1" max="200" />
+              </label>
+              <label class="forecast-field">
+                <span class="forecast-label">Parallelism</span>
+                <input v-model.number="profileParallelism" :disabled="forecastControlsLocked" type="number" min="1" max="20" />
+              </label>
+              <label class="forecast-field">
+                <span class="forecast-label">Duration</span>
+                <input v-model.number="simulationDuration" :disabled="forecastControlsLocked" type="number" min="1" max="240" />
+              </label>
+              <label class="forecast-field">
+                <span class="forecast-label">Min/Round</span>
+                <input v-model.number="minutesPerRoundSetting" :disabled="forecastControlsLocked" type="number" min="5" max="240" />
+              </label>
+              <label class="forecast-field">
+                <span class="forecast-label">Active/Round</span>
+                <input v-model.number="activeAgentsPerRound" :disabled="forecastControlsLocked" type="number" min="1" max="200" />
+              </label>
+              <label class="forecast-field">
+                <span class="forecast-label">Scenario</span>
+                <select v-model="scenarioPack" :disabled="forecastControlsLocked">
+                  <option value="baseline">Baseline</option>
+                  <option value="baseline_adverse_favorable">Baseline + adverse/favorable</option>
+                  <option value="baseline,plaintiff-favorable,defendant-favorable,procedural-delay,settlement-pressure">Litigation ensemble</option>
+                </select>
+              </label>
+              <label class="forecast-field">
+                <span class="forecast-label">Report</span>
+                <select v-model="reportMode" :disabled="forecastControlsLocked">
+                  <option value="litigation_case">Litigation case</option>
+                  <option value="motion_only">Motion-only</option>
+                  <option value="settlement_risk">Settlement risk</option>
+                  <option value="evidence_gap">Evidence gap</option>
+                </select>
+              </label>
+              <label class="forecast-field">
+                <span class="forecast-label">Depth</span>
+                <select v-model="reportDepth" :disabled="forecastControlsLocked">
+                  <option value="fast">Fast</option>
+                  <option value="standard">Standard</option>
+                  <option value="deep">Deep</option>
                 </select>
               </label>
             </div>
@@ -96,6 +156,7 @@
               <span class="mono">{{ forecastSettings.forecast_mode }}</span>
               <span>{{ forecastSettings.forecast_horizon }}</span>
               <span>{{ forecastSettings.ensemble_runs }} run ensemble</span>
+              <span>{{ forecastSettings.prediction_settings?.preset || predictionPreset }}</span>
             </div>
           </div>
 
@@ -694,6 +755,7 @@ const taskId = ref(null)
 const prepareProgress = ref(0)
 const currentStage = ref('')
 const progressMessage = ref('')
+const prepareTiming = ref(null)
 const profiles = ref([])
 const entityTypes = ref([])
 const expectedTotal = ref(null)
@@ -705,6 +767,15 @@ const forecastHorizon = ref('')
 const ensembleRuns = ref(5)
 const memoryMode = ref('practical')
 const forecastSettings = ref(null)
+const predictionPreset = ref('standard_litigation_prediction')
+const agentCount = ref(48)
+const profileParallelism = ref(5)
+const simulationDuration = ref(72)
+const minutesPerRoundSetting = ref(60)
+const activeAgentsPerRound = ref(16)
+const scenarioPack = ref('baseline_adverse_favorable')
+const reportMode = ref('litigation_case')
+const reportDepth = ref('standard')
 
 // Log deduplication：Record key information from last output
 let lastLoggedMessage = ''
@@ -750,6 +821,23 @@ const forecastControlsLocked = computed(() => {
   return phase.value > 0 || !!taskId.value || !!simulationConfig.value
 })
 
+const activePrepareTimingPhase = computed(() => {
+  const active = prepareTiming.value?.active_phases?.[0]
+  return active?.label || active?.name || ''
+})
+
+const formatDuration = (seconds) => {
+  if (seconds === null || seconds === undefined || Number.isNaN(Number(seconds))) return '--'
+  const totalSeconds = Math.max(0, Math.round(Number(seconds)))
+  const minutes = Math.floor(totalSeconds / 60)
+  const remainingSeconds = totalSeconds % 60
+  const hours = Math.floor(minutes / 60)
+  const remainingMinutes = minutes % 60
+  if (hours > 0) return `${hours}h ${remainingMinutes}m`
+  if (minutes > 0) return `${minutes}m ${remainingSeconds}s`
+  return `${remainingSeconds}s`
+}
+
 const effectiveForecastLabel = computed(() => {
   const mode = forecastSettings.value?.forecast_mode || forecastMode.value
   const labels = {
@@ -763,13 +851,28 @@ const effectiveForecastLabel = computed(() => {
 
 const buildForecastPayload = () => {
   const targetQuestion = props.projectData?.simulation_requirement || 'Forecast the most likely future paths.'
+  const predictionSettings = {
+    preset: predictionPreset.value,
+    agent_count: agentCount.value,
+    profile_parallelism: profileParallelism.value,
+    simulation_duration: simulationDuration.value,
+    minutes_per_round: minutesPerRoundSetting.value,
+    active_agents_per_round: activeAgentsPerRound.value,
+    ensemble_runs: ensembleRuns.value,
+    scenario_pack: scenarioPack.value,
+    memory_mode: memoryMode.value,
+    report_mode: reportMode.value,
+    report_depth: reportDepth.value
+  }
   const payload = {
     prediction_target: {
       question: targetQuestion
     },
-    scenario_pack: 'baseline_adverse_favorable',
+    scenario_pack: scenarioPack.value,
     ensemble_runs: ensembleRuns.value,
-    memory_mode: memoryMode.value
+    memory_mode: memoryMode.value,
+    prediction_settings: predictionSettings,
+    ...predictionSettings
   }
   if (forecastMode.value !== 'auto') {
     payload.forecast_mode = forecastMode.value
@@ -779,6 +882,40 @@ const buildForecastPayload = () => {
   }
   return payload
 }
+
+watch(predictionPreset, (preset) => {
+  if (preset === 'quick_legal_read') {
+    agentCount.value = 24
+    profileParallelism.value = 4
+    simulationDuration.value = 24
+    minutesPerRoundSetting.value = 60
+    activeAgentsPerRound.value = 8
+    ensembleRuns.value = 1
+    scenarioPack.value = 'baseline'
+    memoryMode.value = 'off'
+    reportDepth.value = 'fast'
+  } else if (preset === 'deep_adversarial_run') {
+    agentCount.value = 96
+    profileParallelism.value = 8
+    simulationDuration.value = 120
+    minutesPerRoundSetting.value = 30
+    activeAgentsPerRound.value = 24
+    ensembleRuns.value = 10
+    scenarioPack.value = 'baseline,plaintiff-favorable,defendant-favorable,procedural-delay,settlement-pressure'
+    memoryMode.value = 'full'
+    reportDepth.value = 'deep'
+  } else {
+    agentCount.value = 48
+    profileParallelism.value = 5
+    simulationDuration.value = 72
+    minutesPerRoundSetting.value = 60
+    activeAgentsPerRound.value = 16
+    ensembleRuns.value = 5
+    scenarioPack.value = 'baseline_adverse_favorable'
+    memoryMode.value = 'practical'
+    reportDepth.value = 'standard'
+  }
+})
 
 // Polling timer
 let pollTimer = null
@@ -860,7 +997,7 @@ const startPrepareSimulation = async () => {
     const res = await prepareSimulation({
       simulation_id: props.simulationId,
       use_llm_for_profiles: true,
-      parallel_profile_count: 5,
+      parallel_profile_count: profileParallelism.value,
       ...buildForecastPayload()
     })
     
@@ -873,6 +1010,12 @@ const startPrepareSimulation = async () => {
       
       taskId.value = res.data.task_id
       forecastSettings.value = res.data.forecast_settings || forecastSettings.value
+      if (res.data.prediction_settings) {
+        forecastSettings.value = {
+          ...(forecastSettings.value || {}),
+          prediction_settings: res.data.prediction_settings
+        }
+      }
       addLog(`Preparation task started`)
       addLog(`  └─ Task ID: ${res.data.task_id}`)
       
@@ -941,6 +1084,9 @@ const pollPrepareStatus = async () => {
       // Parse phase information and output detailed log
       if (data.progress_detail) {
         currentStage.value = data.progress_detail.current_stage_name || ''
+        if (data.progress_detail.timing) {
+          prepareTiming.value = data.progress_detail.timing
+        }
         
         // Output detailed progress log（Avoid duplication）
         const detail = data.progress_detail
@@ -969,6 +1115,10 @@ const pollPrepareStatus = async () => {
       
       // Check if completed
       if (data.status === 'completed' || data.status === 'ready' || data.already_prepared) {
+        const completedTiming = data.result?.timings?.simulation_prepare || data.prepare_info?.timings?.simulation_prepare
+        if (completedTiming) {
+          prepareTiming.value = completedTiming
+        }
         addLog('✓ Preparation work completed')
         stopPolling()
         stopProfilesPolling()
@@ -1385,6 +1535,15 @@ onUnmounted(() => {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 10px;
+}
+
+.prediction-settings-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid #E5E7EB;
 }
 
 .forecast-field {

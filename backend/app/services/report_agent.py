@@ -21,6 +21,7 @@ from enum import Enum
 from ..config import Config
 from ..utils.llm_client import LLMClient
 from ..utils.logger import get_logger
+from ..utils.timing import PhaseTimer
 from .graph_tools import (
     GraphToolsService,
     SearchResult,
@@ -460,6 +461,7 @@ class Report:
     simulation_requirement: str
     status: ReportStatus
     report_mode: str = "prediction"
+    report_depth: str = "standard"
     outline: Optional[ReportOutline] = None
     markdown_content: str = ""
     created_at: str = ""
@@ -468,6 +470,7 @@ class Report:
     validation_issues: List[Dict[str, Any]] = field(default_factory=list)
     quality_score: Dict[str, Any] = field(default_factory=dict)
     forecast: Dict[str, Any] = field(default_factory=dict)
+    timing: Dict[str, Any] = field(default_factory=dict)
     
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -476,6 +479,7 @@ class Report:
             "graph_id": self.graph_id,
             "simulation_requirement": self.simulation_requirement,
             "report_mode": self.report_mode,
+            "report_depth": self.report_depth,
             "status": self.status.value,
             "outline": self.outline.to_dict() if self.outline else None,
             "markdown_content": self.markdown_content,
@@ -485,6 +489,7 @@ class Report:
             "validation_issues": self.validation_issues,
             "quality_score": self.quality_score,
             "forecast": self.forecast,
+            "timing": self.timing,
         }
 
 
@@ -531,7 +536,14 @@ REPORT_MODE_LABELS = {
 
 def normalize_report_mode(mode: Optional[str]) -> str:
     normalized = (mode or "prediction").strip().lower().replace("-", "_")
+    if normalized in {"litigation_case", "motion_only", "settlement_risk", "evidence_gap"}:
+        return "legal_case"
     return normalized if normalized in REPORT_MODE_GUIDANCE else "prediction"
+
+
+def normalize_report_depth(depth: Optional[str]) -> str:
+    normalized = (depth or "standard").strip().lower().replace("-", "_")
+    return normalized if normalized in {"fast", "standard", "deep"} else "standard"
 
 
 # ── Tool Descriptions ──
@@ -979,6 +991,7 @@ class ReportAgent:
         disable_interviews: bool = False,
         strict_antirepetition: bool = False,
         report_mode: str = "prediction",
+        report_depth: str = "standard",
     ):
         """
         Initialize Report Agent
@@ -1003,6 +1016,15 @@ class ReportAgent:
         if report_mode == "prediction" and self.forecast_settings.get("forecast_mode") != "general":
             report_mode = infer_report_mode_from_forecast(self.forecast_settings.get("forecast_mode"))
         self.report_mode = normalize_report_mode(report_mode)
+        self.report_depth = normalize_report_depth(report_depth or self.simulation_config.get("report_depth"))
+        self.phase_timings: Dict[str, float] = {}
+        if self.report_depth == "fast":
+            self.disable_interviews = True
+            self.MAX_TOOL_CALLS_PER_SECTION = min(self.MAX_TOOL_CALLS_PER_SECTION, 2)
+            self.MAX_REFLECTION_ROUNDS = 1
+        elif self.report_depth == "deep":
+            self.MAX_TOOL_CALLS_PER_SECTION = max(self.MAX_TOOL_CALLS_PER_SECTION, 8)
+            self.MAX_REFLECTION_ROUNDS = max(self.MAX_REFLECTION_ROUNDS, 3)
 
         self.llm = llm_client or LLMClient()
         if graph_tools is None:
@@ -1114,7 +1136,9 @@ class ReportAgent:
                     graph_id=self.graph_id,
                     query=query,
                     simulation_requirement=self.simulation_requirement,
-                    report_context=ctx
+                    report_context=ctx,
+                    max_sub_queries=5 if self.report_depth == "deep" else 1,
+                    use_llm_decomposition=self.report_depth == "deep",
                 )
                 return result.to_text()
             
@@ -1831,11 +1855,21 @@ class ReportAgent:
             simulation_requirement=self.simulation_requirement,
             status=ReportStatus.PENDING,
             report_mode=self.report_mode,
+            report_depth=self.report_depth,
             created_at=datetime.now().isoformat()
         )
+        timing = PhaseTimer("report_generation", metadata={
+            "report_id": report_id,
+            "simulation_id": self.simulation_id,
+            "graph_id": self.graph_id,
+            "report_mode": self.report_mode,
+            "report_depth": self.report_depth,
+        })
         
         # CompletedSection Titlelist（for progress tracking）
         completed_section_titles = []
+        failed_section_index = None
+        failed_section_title = None
         
         try:
             # Initialize: Create report folder and save initial state
@@ -1854,7 +1888,8 @@ class ReportAgent:
             
             ReportManager.update_progress(
                 report_id, "pending", 0, "Initializereport...",
-                completed_sections=[]
+                completed_sections=[],
+                timing=timing.snapshot(),
             )
             ReportManager.save_report(report)
             
@@ -1862,7 +1897,8 @@ class ReportAgent:
             report.status = ReportStatus.PLANNING
             ReportManager.update_progress(
                 report_id, "planning", 5, "Start planning report outline...",
-                completed_sections=[]
+                completed_sections=[],
+                timing=timing.snapshot(),
             )
             
             # Log outline planning start
@@ -1871,10 +1907,12 @@ class ReportAgent:
             if progress_callback:
                 progress_callback("planning", 0, "Start planning report outline...")
             
-            outline = self.plan_outline(
-                progress_callback=lambda stage, prog, msg: 
-                    progress_callback(stage, prog // 5, msg) if progress_callback else None
-            )
+            with timing.time("outline", label="Plan report outline"):
+                outline = self.plan_outline(
+                    progress_callback=lambda stage, prog, msg:
+                        progress_callback(stage, prog // 5, msg) if progress_callback else None
+                )
+            self.phase_timings["outline_seconds"] = timing.snapshot()["phase_totals"].get("outline", 0.0)
             report.outline = outline
             
             # recordplancompletion log
@@ -1884,7 +1922,8 @@ class ReportAgent:
             ReportManager.save_outline(report_id, outline)
             ReportManager.update_progress(
                 report_id, "planning", 15, f"Outline planning completed, total{len(outline.sections)}sections",
-                completed_sections=[]
+                completed_sections=[],
+                timing=timing.snapshot(),
             )
             ReportManager.save_report(report)
             
@@ -1898,6 +1937,8 @@ class ReportAgent:
             
             for i, section in enumerate(outline.sections):
                 section_num = i + 1
+                failed_section_index = section_num
+                failed_section_title = section.title
                 base_progress = 20 + int((i / total_sections) * 70)
                 
                 # Update progress
@@ -1905,7 +1946,8 @@ class ReportAgent:
                     report_id, "generating", base_progress,
                     f"generatinggenerateSection: {section.title} ({section_num}/{total_sections})",
                     current_section=section.title,
-                    completed_sections=completed_section_titles
+                    completed_sections=completed_section_titles,
+                    timing=timing.snapshot(),
                 )
                 
                 if progress_callback:
@@ -1916,17 +1958,24 @@ class ReportAgent:
                     )
                 
                 # Generate main sectioncontent
-                section_content = self._generate_section_react(
-                    section=section,
-                    outline=outline,
-                    previous_sections=generated_sections,
-                    progress_callback=lambda stage, prog, msg:
-                        progress_callback(
-                            stage, 
-                            base_progress + int(prog * 0.7 / total_sections),
-                            msg
-                        ) if progress_callback else None,
-                    section_index=section_num
+                section_phase = f"section_{section_num:02d}"
+                with timing.time(section_phase, label=section.title, metadata={"section_index": section_num}):
+                    section_content = self._generate_section_react(
+                        section=section,
+                        outline=outline,
+                        previous_sections=generated_sections,
+                        progress_callback=lambda stage, prog, msg:
+                            progress_callback(
+                                stage,
+                                base_progress + int(prog * 0.7 / total_sections),
+                                msg
+                            ) if progress_callback else None,
+                        section_index=section_num
+                    )
+                self.phase_timings["section_generation_seconds"] = round(
+                    self.phase_timings.get("section_generation_seconds", 0.0)
+                    + timing.snapshot()["phase_totals"].get(section_phase, 0.0),
+                    4,
                 )
                 
                 section.content = section_content
@@ -1954,7 +2003,8 @@ class ReportAgent:
                     base_progress + int(70 / total_sections),
                     f"Section {section.title} completed",
                     current_section=None,
-                    completed_sections=completed_section_titles
+                    completed_sections=completed_section_titles,
+                    timing=timing.snapshot(),
                 )
             
             # phase3: assembleComplete report
@@ -1963,14 +2013,21 @@ class ReportAgent:
             
             ReportManager.update_progress(
                 report_id, "generating", 95, "generatingassemblecompletereport...",
-                completed_sections=completed_section_titles
+                completed_sections=completed_section_titles,
+                timing=timing.snapshot(),
             )
             
             # Using ReportManagerassembleComplete report
-            report.markdown_content = ReportManager.assemble_full_report(report_id, outline)
-            self._apply_forecast_synthesis(report, outline)
-            report.validation_issues = ReportManager.validate_report_output(report)
-            report.quality_score = ReportManager.evaluate_report_quality(report)
+            with timing.time("merge", label="Assemble report markdown"):
+                report.markdown_content = ReportManager.assemble_full_report(report_id, outline)
+            self.phase_timings["merge_seconds"] = timing.snapshot()["phase_totals"].get("merge", 0.0)
+            with timing.time("forecast_synthesis", label="Synthesize forecast"):
+                self._apply_forecast_synthesis(report, outline)
+            self.phase_timings["forecast_synthesis_seconds"] = timing.snapshot()["phase_totals"].get("forecast_synthesis", 0.0)
+            with timing.time("validation", label="Validate report output"):
+                report.validation_issues = ReportManager.validate_report_output(report)
+                report.quality_score = ReportManager.evaluate_report_quality(report)
+            self.phase_timings["validation_seconds"] = timing.snapshot()["phase_totals"].get("validation", 0.0)
             blocking_issues = [issue for issue in report.validation_issues if issue.get("blocking")]
             if blocking_issues:
                 raise ValueError(
@@ -1979,9 +2036,14 @@ class ReportAgent:
                 )
             ReportManager.apply_quality_status(report)
             report.completed_at = datetime.now().isoformat()
+            report.timing = timing.complete(metadata={"total_sections": total_sections})
+            report.quality_score["timings"] = {
+                **self.phase_timings,
+                "total_seconds": report.timing["total_seconds"],
+            }
             
             # Calculate total elapsed time
-            total_time_seconds = (datetime.now() - start_time).total_seconds()
+            total_time_seconds = report.timing["total_seconds"]
             
             # recordReportcompletion log
             if self.report_logger:
@@ -1995,8 +2057,11 @@ class ReportAgent:
             ReportManager.update_progress(
                 report_id, report.status.value, 100,
                 "reportgeneratecomplete" if report.status == ReportStatus.COMPLETED else "reportneedsreview",
-                completed_sections=completed_section_titles
+                completed_sections=completed_section_titles,
+                timing=report.timing,
             )
+            failed_section_index = None
+            failed_section_title = None
             
             if progress_callback:
                 progress_callback(report.status.value, 100, "reportgeneratecomplete")
@@ -2014,6 +2079,7 @@ class ReportAgent:
             logger.error(f"reportgeneratefailed: {str(e)}")
             report.status = ReportStatus.FAILED
             report.error = str(e)
+            report.timing = timing.fail(str(e))
             
             # recorderrorlog
             if self.report_logger:
@@ -2024,7 +2090,11 @@ class ReportAgent:
                 ReportManager.save_report(report)
                 ReportManager.update_progress(
                     report_id, "failed", -1, f"reportgeneratefailed: {str(e)}",
-                    completed_sections=completed_section_titles
+                    completed_sections=completed_section_titles,
+                    current_section=failed_section_title,
+                    failed_section_index=failed_section_index,
+                    failed_section_title=failed_section_title,
+                    timing=report.timing,
                 )
             except Exception:
                 pass  # ignoresavefailederror
@@ -2035,6 +2105,156 @@ class ReportAgent:
                 self.console_logger = None
             
             return report
+
+    def resume_report(
+        self,
+        report: Report,
+        progress_callback: Optional[Callable[[str, int, str], None]] = None,
+    ) -> Report:
+        """Resume a failed or partial report from the first missing section."""
+        if not report.outline:
+            raise ValueError("Report has no outline; cannot resume")
+
+        start_time = datetime.now()
+        timing = PhaseTimer("report_resume", metadata={
+            "report_id": report.report_id,
+            "simulation_id": report.simulation_id,
+            "graph_id": report.graph_id,
+        })
+        report.status = ReportStatus.GENERATING
+        report.error = None
+        ReportManager._ensure_report_folder(report.report_id)
+        self.report_logger = ReportLogger(report.report_id)
+        self.console_logger = ReportConsoleLogger(report.report_id)
+
+        generated = {
+            item["section_index"]: item["content"]
+            for item in ReportManager.get_generated_sections(report.report_id)
+        }
+        for index, section in enumerate(report.outline.sections, start=1):
+            if index in generated:
+                section.content = ReportManager._clean_section_content(generated[index], section.title)
+
+        progress = ReportManager.get_progress(report.report_id) or {}
+        failed_index = progress.get("failed_section_index")
+        missing_indexes = [
+            index for index, section in enumerate(report.outline.sections, start=1)
+            if not section.content and index not in generated
+        ]
+        start_index = int(failed_index or (missing_indexes[0] if missing_indexes else 1))
+        start_index = max(1, min(start_index, len(report.outline.sections)))
+        completed_section_titles = [
+            section.title
+            for index, section in enumerate(report.outline.sections, start=1)
+            if index < start_index and (section.content or index in generated)
+        ]
+
+        try:
+            total_sections = len(report.outline.sections)
+            previous_sections = [
+                f"## {section.title}\n\n{section.content}"
+                for index, section in enumerate(report.outline.sections, start=1)
+                if index < start_index and section.content
+            ]
+
+            for index in range(start_index, total_sections + 1):
+                section = report.outline.sections[index - 1]
+                base_progress = 20 + int(((index - 1) / total_sections) * 70)
+                ReportManager.update_progress(
+                    report.report_id,
+                    "generating",
+                    base_progress,
+                    f"resuming section {index}: {section.title}",
+                    current_section=section.title,
+                    completed_sections=completed_section_titles,
+                    failed_section_index=None,
+                    failed_section_title=None,
+                    timing=timing.snapshot(),
+                )
+                if progress_callback:
+                    progress_callback("generating", base_progress, f"resuming section {index}: {section.title}")
+
+                with timing.time(f"section_{index:02d}", label=section.title, metadata={"section_index": index}):
+                    section.content = self._generate_section_react(
+                        section=section,
+                        outline=report.outline,
+                        previous_sections=previous_sections,
+                        progress_callback=lambda stage, prog, msg:
+                            progress_callback(
+                                stage,
+                                base_progress + int(prog * 0.7 / total_sections),
+                                msg,
+                            ) if progress_callback else None,
+                        section_index=index,
+                    )
+                previous_sections.append(f"## {section.title}\n\n{section.content}")
+                ReportManager.save_section(report.report_id, index, section)
+                completed_section_titles.append(section.title)
+                if self.report_logger:
+                    self.report_logger.log_section_full_complete(
+                        section_title=section.title,
+                        section_index=index,
+                        full_content=f"## {section.title}\n\n{section.content}".strip(),
+                    )
+
+            with timing.time("merge", label="Assemble report markdown"):
+                report.markdown_content = ReportManager.assemble_full_report(report.report_id, report.outline)
+            with timing.time("forecast_synthesis", label="Synthesize forecast"):
+                self._apply_forecast_synthesis(report, report.outline)
+            with timing.time("validation", label="Validate report output"):
+                report.validation_issues = ReportManager.validate_report_output(report)
+            blocking_issues = [issue for issue in report.validation_issues if issue.get("blocking")]
+            if blocking_issues:
+                raise ValueError(
+                    "Report output validation failed: "
+                    + "; ".join(issue["message"] for issue in blocking_issues)
+                )
+            report.quality_score = ReportManager.evaluate_report_quality(report)
+            ReportManager.apply_quality_status(report)
+            report.completed_at = datetime.now().isoformat()
+            report.timing = timing.complete(metadata={"total_sections": total_sections, "resumed_from_section": start_index})
+            report.quality_score["timings"] = {
+                **(report.quality_score.get("timings") or {}),
+                "total_seconds": report.timing["total_seconds"],
+            }
+            if self.report_logger:
+                self.report_logger.log_report_complete(
+                    total_sections=total_sections,
+                    total_time_seconds=report.timing["total_seconds"],
+                )
+            ReportManager.save_report(report)
+            ReportManager.update_progress(
+                report.report_id,
+                report.status.value,
+                100,
+                "report resume complete",
+                completed_sections=[section.title for section in report.outline.sections],
+                failed_section_index=None,
+                failed_section_title=None,
+                timing=report.timing,
+            )
+            return report
+        except Exception as e:
+            report.status = ReportStatus.FAILED
+            report.error = str(e)
+            report.timing = timing.fail(str(e))
+            ReportManager.save_report(report)
+            ReportManager.update_progress(
+                report.report_id,
+                "failed",
+                -1,
+                f"reportresumefailed: {str(e)}",
+                current_section=section.title if 'section' in locals() else None,
+                completed_sections=completed_section_titles,
+                failed_section_index=index if 'index' in locals() else start_index,
+                failed_section_title=section.title if 'section' in locals() else None,
+                timing=report.timing,
+            )
+            raise
+        finally:
+            if self.console_logger:
+                self.console_logger.close()
+                self.console_logger = None
 
     def regenerate_section(
         self,
@@ -2586,7 +2806,10 @@ class ReportManager:
         progress: int, 
         message: str,
         current_section: str = None,
-        completed_sections: List[str] = None
+        completed_sections: List[str] = None,
+        failed_section_index: Optional[int] = None,
+        failed_section_title: Optional[str] = None,
+        timing: Optional[Dict[str, Any]] = None,
     ) -> None:
         """
         UpdateReportgenerateProgress
@@ -2601,6 +2824,9 @@ class ReportManager:
             "message": message,
             "current_section": current_section,
             "completed_sections": completed_sections or [],
+            "failed_section_index": failed_section_index,
+            "failed_section_title": failed_section_title,
+            "timing": timing,
             "updated_at": datetime.now().isoformat(),
             "heartbeat_at": datetime.now().isoformat(),
         }
@@ -2883,6 +3109,21 @@ class ReportManager:
                 "blocking": False,
                 "message": "Report content includes degraded retrieval warnings.",
             })
+        if normalize_report_mode(report.report_mode) == "legal_case":
+            conclusion_terms = re.findall(
+                r"\b(likely|probability|probable|succeeds|fails|strong case|weak case|liability|injunction|damages)\b",
+                content,
+                flags=re.IGNORECASE,
+            )
+            citation_markers = len(re.findall(r"\[[^\]]+\]|\(source:|evidence card|citation", content, flags=re.IGNORECASE))
+            if conclusion_terms and citation_markers < max(1, len(conclusion_terms) // 8):
+                issues.append({
+                    "code": "uncited_litigation_conclusion",
+                    "severity": "warning",
+                    "blocking": False,
+                    "message": "Legal conclusions need more citations or evidence references.",
+                    "count": len(conclusion_terms),
+                })
         repeated_facts = cls._find_repeated_facts(content)
         if repeated_facts:
             issues.append({
@@ -2920,6 +3161,7 @@ class ReportManager:
             "degraded_retrieval": 25,
             "repeated_fact": 20,
             "meta_commentary": 10,
+            "uncited_litigation_conclusion": 12,
         }
 
         for issue in issues:
@@ -3094,7 +3336,12 @@ class ReportManager:
         
         with open(path, 'r', encoding='utf-8') as f:
             data = json.load(f)
-        
+
+        return cls._dict_to_report(report_id, data)
+
+    @classmethod
+    def _dict_to_report(cls, report_id: str, data: Dict[str, Any]) -> Report:
+        """Rebuild a Report object from persisted metadata."""
         # rebuildReportobject
         outline = None
         if data.get('outline'):
@@ -3128,6 +3375,7 @@ class ReportManager:
             simulation_requirement=data['simulation_requirement'],
             status=ReportStatus(data['status']),
             report_mode=normalize_report_mode(data.get('report_mode')),
+            report_depth=normalize_report_depth(data.get('report_depth')),
             outline=outline,
             markdown_content=markdown_content,
             created_at=data.get('created_at', ''),
@@ -3136,6 +3384,7 @@ class ReportManager:
             validation_issues=data.get('validation_issues', []),
             quality_score=data.get('quality_score', {}),
             forecast=data.get('forecast', {}),
+            timing=data.get('timing', {}),
         )
     
     @classmethod

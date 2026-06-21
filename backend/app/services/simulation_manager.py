@@ -14,10 +14,12 @@ from enum import Enum
 
 from ..config import Config
 from ..utils.logger import get_logger
+from ..utils.timing import PhaseTimer
 from .entity_reader import EntityReader, FilteredEntities
 from .oasis_profile_generator import OasisProfileGenerator, OasisAgentProfile
 from .simulation_config_generator import SimulationConfigGenerator, SimulationParameters
 from .forecasting import ForecastSettings, normalize_forecast_settings
+from ..models.case import normalize_prediction_settings
 
 logger = get_logger('mirofish.simulation')
 
@@ -82,6 +84,10 @@ class SimulationState:
     scenario_pack: str = "baseline_adverse_favorable"
     ensemble_runs: int = 5
     memory_mode: str = "practical"
+    prediction_settings: Dict[str, Any] = field(default_factory=dict)
+    report_mode: str = "litigation_case"
+    report_depth: str = "standard"
+    timings: Dict[str, Any] = field(default_factory=dict)
     
     def to_dict(self) -> Dict[str, Any]:
         """Complete status dict (internal use)"""
@@ -109,6 +115,10 @@ class SimulationState:
             "scenario_pack": self.scenario_pack,
             "ensemble_runs": self.ensemble_runs,
             "memory_mode": self.memory_mode,
+            "prediction_settings": self.prediction_settings,
+            "report_mode": self.report_mode,
+            "report_depth": self.report_depth,
+            "timings": self.timings,
         }
     
     def to_simple_dict(self) -> Dict[str, Any]:
@@ -129,6 +139,10 @@ class SimulationState:
             "scenario_pack": self.scenario_pack,
             "ensemble_runs": self.ensemble_runs,
             "memory_mode": self.memory_mode,
+            "prediction_settings": self.prediction_settings,
+            "report_mode": self.report_mode,
+            "report_depth": self.report_depth,
+            "timings": self.timings,
         }
 
 
@@ -212,6 +226,10 @@ class SimulationManager:
             scenario_pack=data.get("scenario_pack", "baseline_adverse_favorable"),
             ensemble_runs=data.get("ensemble_runs", 5),
             memory_mode=data.get("memory_mode", "practical"),
+            prediction_settings=data.get("prediction_settings", {}),
+            report_mode=data.get("report_mode", "litigation_case"),
+            report_depth=data.get("report_depth", "standard"),
+            timings=data.get("timings", {}),
         )
         
         self._simulations[simulation_id] = state
@@ -223,6 +241,7 @@ class SimulationManager:
         graph_id: str,
         enable_twitter: bool = True,
         enable_reddit: bool = True,
+        prediction_settings: Optional[Dict[str, Any]] = None,
     ) -> SimulationState:
         """
         Create new simulation
@@ -246,7 +265,10 @@ class SimulationManager:
             enable_twitter=enable_twitter,
             enable_reddit=enable_reddit,
             status=SimulationStatus.CREATED,
+            prediction_settings=normalize_prediction_settings(prediction_settings),
         )
+        state.report_mode = state.prediction_settings.get("report_mode", "litigation_case")
+        state.report_depth = state.prediction_settings.get("report_depth", "standard")
         
         self._save_simulation_state(state)
         logger.info(f"Create simulation: {simulation_id}, project={project_id}, graph={graph_id}")
@@ -264,6 +286,7 @@ class SimulationManager:
         parallel_profile_count: int = 3,
         storage: 'GraphStorage' = None,
         forecast_settings: Optional[ForecastSettings] = None,
+        prediction_settings: Optional[Dict[str, Any]] = None,
     ) -> SimulationState:
         """
         Prepare simulation environment (fully automated)
@@ -290,7 +313,13 @@ class SimulationManager:
         state = self._load_simulation_state(simulation_id)
         if not state:
             raise ValueError(f"Simulation does not exist: {simulation_id}")
-        
+
+        timing = PhaseTimer("simulation_prepare", metadata={"simulation_id": simulation_id})
+
+        def emit_progress(stage: str, progress: int, message: str, **kwargs):
+            if progress_callback:
+                progress_callback(stage, progress, message, timing=timing.snapshot(), **kwargs)
+
         try:
             state.status = SimulationStatus.PREPARING
             if forecast_settings is None:
@@ -305,72 +334,90 @@ class SimulationManager:
             state.scenario_pack = forecast_settings.scenario_pack
             state.ensemble_runs = forecast_settings.ensemble_runs
             state.memory_mode = forecast_settings.memory_mode
+            state.prediction_settings = normalize_prediction_settings(
+                prediction_settings or state.prediction_settings
+            )
+            state.report_mode = state.prediction_settings.get("report_mode", state.report_mode)
+            state.report_depth = state.prediction_settings.get("report_depth", state.report_depth)
+            state.timings = {**(state.timings or {}), "simulation_prepare": timing.snapshot()}
             self._save_simulation_state(state)
             
             sim_dir = self._get_simulation_dir(simulation_id)
             
             # ========== Phase 1: Read and filter entities ==========
-            if progress_callback:
-                progress_callback("reading", 0, "Connecting to graph...")
+            emit_progress("reading", 0, "Connecting to graph...")
 
             if not storage:
                 raise ValueError("storage (GraphStorage) is required for prepare_simulation")
             reader = EntityReader(storage)
-            
-            if progress_callback:
-                progress_callback("reading", 30, "Reading node data...")
-            
-            filtered = reader.filter_defined_entities(
-                graph_id=state.graph_id,
-                defined_entity_types=defined_entity_types,
-                enrich_with_edges=True
-            )
+
+            emit_progress("reading", 30, "Reading node data...")
+
+            with timing.time("read_entities", label="Read and filter graph entities"):
+                filtered = reader.filter_defined_entities(
+                    graph_id=state.graph_id,
+                    defined_entity_types=defined_entity_types,
+                    enrich_with_edges=True
+                )
+            agent_count = int(state.prediction_settings.get("agent_count") or 0)
+            excluded_types = set(state.prediction_settings.get("entity_types_exclude") or [])
+            if excluded_types:
+                filtered.entities = [
+                    entity for entity in filtered.entities
+                    if entity.get_entity_type() not in excluded_types
+                ]
+            if agent_count > 0 and len(filtered.entities) > agent_count:
+                filtered.entities = filtered.entities[:agent_count]
+            filtered.filtered_count = len(filtered.entities)
+            filtered.entity_types = {
+                entity.get_entity_type() or "Unknown"
+                for entity in filtered.entities
+            }
             
             state.entities_count = filtered.filtered_count
             state.entity_types = list(filtered.entity_types)
             
-            if progress_callback:
-                progress_callback(
-                    "reading", 100, 
-                    f"Completed, total {filtered.filtered_count} entities",
-                    current=filtered.filtered_count,
-                    total=filtered.filtered_count
-                )
+            emit_progress(
+                "reading", 100,
+                f"Completed, total {filtered.filtered_count} entities",
+                current=filtered.filtered_count,
+                total=filtered.filtered_count
+            )
             
             if filtered.filtered_count == 0:
                 state.status = SimulationStatus.FAILED
                 state.error = "No entities matching criteria found, check if graph is correctly constructed"
+                state.timings = {**(state.timings or {}), "simulation_prepare": timing.fail(state.error)}
                 self._save_simulation_state(state)
                 return state
             
             # ========== Phase 2: Generate Agent Profile ==========
             total_entities = len(filtered.entities)
             
-            if progress_callback:
-                progress_callback(
-                    "generating_profiles", 0, 
-                    "Starting generation...",
-                    current=0,
-                    total=total_entities
-                )
+            emit_progress(
+                "generating_profiles", 0,
+                "Starting generation...",
+                current=0,
+                total=total_entities
+            )
             
             # Pass graph_id to enable graph retrieval functionality, get richer context
             generator = OasisProfileGenerator(
                 storage=storage,
                 graph_id=state.graph_id,
                 forecast_settings=forecast_settings.to_dict(),
+                prediction_settings=state.prediction_settings,
             )
             
             def profile_progress(current, total, msg):
-                if progress_callback:
-                    progress_callback(
-                        "generating_profiles", 
-                        int(current / total * 100), 
-                        msg,
-                        current=current,
-                        total=total,
-                        item_name=msg
-                    )
+                emit_progress(
+                    "generating_profiles",
+                    int(current / total * 100),
+                    msg,
+                    current=current,
+                    total=total,
+                    item_name=msg
+                )
             
             # Set real-time save file path (prefer Reddit JSON format)
             realtime_output_path = None
@@ -382,111 +429,115 @@ class SimulationManager:
                 realtime_output_path = os.path.join(sim_dir, "twitter_profiles.csv")
                 realtime_platform = "twitter"
             
-            profiles = generator.generate_profiles_from_entities(
-                entities=filtered.entities,
-                use_llm=use_llm_for_profiles,
-                progress_callback=profile_progress,
-                graph_id=state.graph_id,  # Pass graph_id for graph retrieval
-                parallel_count=parallel_profile_count,  # Parallel generation count
-                realtime_output_path=realtime_output_path,  # Real-time save path
-                output_platform=realtime_platform  # Output format
-            )
+            with timing.time("generate_profiles", label="Generate agent profiles", metadata={"entity_count": total_entities}):
+                profiles = generator.generate_profiles_from_entities(
+                    entities=filtered.entities,
+                    use_llm=use_llm_for_profiles,
+                    progress_callback=profile_progress,
+                    graph_id=state.graph_id,  # Pass graph_id for graph retrieval
+                    parallel_count=parallel_profile_count,  # Parallel generation count
+                    realtime_output_path=realtime_output_path,  # Real-time save path
+                    output_platform=realtime_platform  # Output format
+                )
             
             state.profiles_count = len(profiles)
             
             # Save Profile files (Note: Twitter uses CSV format, Reddit uses JSON format)
             # Reddit has been saved in real-time during generation, save once more here to ensure completeness
-            if progress_callback:
-                progress_callback(
-                    "generating_profiles", 95, 
-                    "Saving Profile files...",
-                    current=total_entities,
-                    total=total_entities
-                )
-            
-            if state.enable_reddit:
-                generator.save_profiles(
-                    profiles=profiles,
-                    file_path=os.path.join(sim_dir, "reddit_profiles.json"),
-                    platform="reddit"
-                )
-            
-            if state.enable_twitter:
-                # Twitter uses CSV format! This is OASIS requirement
-                generator.save_profiles(
-                    profiles=profiles,
-                    file_path=os.path.join(sim_dir, "twitter_profiles.csv"),
-                    platform="twitter"
-                )
-            
-            if progress_callback:
-                progress_callback(
-                    "generating_profiles", 100, 
-                    f"Completed, total {len(profiles)} Profiles",
-                    current=len(profiles),
-                    total=len(profiles)
-                )
+            emit_progress(
+                "generating_profiles", 95,
+                "Saving Profile files...",
+                current=total_entities,
+                total=total_entities
+            )
+
+            with timing.time("save_profiles", label="Persist generated profiles", metadata={"profile_count": len(profiles)}):
+                if state.enable_reddit:
+                    generator.save_profiles(
+                        profiles=profiles,
+                        file_path=os.path.join(sim_dir, "reddit_profiles.json"),
+                        platform="reddit"
+                    )
+
+                if state.enable_twitter:
+                    # Twitter uses CSV format! This is OASIS requirement
+                    generator.save_profiles(
+                        profiles=profiles,
+                        file_path=os.path.join(sim_dir, "twitter_profiles.csv"),
+                        platform="twitter"
+                    )
+
+            emit_progress(
+                "generating_profiles", 100,
+                f"Completed, total {len(profiles)} Profiles",
+                current=len(profiles),
+                total=len(profiles)
+            )
             
             # ========== Phase 3: LLM intelligent generation of simulation config ==========
-            if progress_callback:
-                progress_callback(
-                    "generating_config", 0, 
-                    "Analyzing simulation requirements...",
-                    current=0,
-                    total=3
-                )
+            emit_progress(
+                "generating_config", 0,
+                "Analyzing simulation requirements...",
+                current=0,
+                total=3
+            )
             
             config_generator = SimulationConfigGenerator()
             
-            if progress_callback:
-                progress_callback(
-                    "generating_config", 30, 
-                    "Calling LLM to generate config...",
-                    current=1,
-                    total=3
-                )
-            
-            sim_params = config_generator.generate_config(
-                simulation_id=simulation_id,
-                project_id=state.project_id,
-                graph_id=state.graph_id,
-                simulation_requirement=simulation_requirement,
-                document_text=document_text,
-                entities=filtered.entities,
-                enable_twitter=state.enable_twitter,
-                enable_reddit=state.enable_reddit,
-                forecast_settings=forecast_settings.to_dict(),
+            emit_progress(
+                "generating_config", 30,
+                "Calling LLM to generate config...",
+                current=1,
+                total=3
             )
-            
-            if progress_callback:
-                progress_callback(
-                    "generating_config", 70, 
-                    "Saving config files...",
-                    current=2,
-                    total=3
+
+            with timing.time("generate_config", label="Generate simulation config", metadata={"profile_count": len(profiles)}):
+                sim_params = config_generator.generate_config(
+                    simulation_id=simulation_id,
+                    project_id=state.project_id,
+                    graph_id=state.graph_id,
+                    simulation_requirement=simulation_requirement,
+                    document_text=document_text,
+                    entities=filtered.entities,
+                    enable_twitter=state.enable_twitter,
+                    enable_reddit=state.enable_reddit,
+                    forecast_settings=forecast_settings.to_dict(),
                 )
-            
+
+            emit_progress(
+                "generating_config", 70,
+                "Saving config files...",
+                current=2,
+                total=3
+            )
+
             # Save config files
             config_path = os.path.join(sim_dir, "simulation_config.json")
-            with open(config_path, 'w', encoding='utf-8') as f:
-                f.write(sim_params.to_json())
+            with timing.time("save_config", label="Persist simulation config"):
+                with open(config_path, 'w', encoding='utf-8') as f:
+                    f.write(sim_params.to_json())
             
             state.config_generated = True
             state.config_reasoning = sim_params.generation_reasoning
             
-            if progress_callback:
-                progress_callback(
-                    "generating_config", 100, 
-                    "Config generation completed",
-                    current=3,
-                    total=3
-                )
+            emit_progress(
+                "generating_config", 100,
+                "Config generation completed",
+                current=3,
+                total=3
+            )
             
             # Note: Run scripts remain in backend/scripts/ directory, no longer copy to simulation directory
             # When starting simulation, simulation_runner runs scripts from scripts/ directory
             
             # Update status
             state.status = SimulationStatus.READY
+            timing_summary = timing.complete(metadata={
+                "entities_count": state.entities_count,
+                "profiles_count": state.profiles_count,
+                "config_generated": state.config_generated,
+            })
+            state.timings = {**(state.timings or {}), "simulation_prepare": timing_summary}
             self._save_simulation_state(state)
             
             logger.info(f"Simulation preparation completed: {simulation_id}, "
@@ -500,6 +551,7 @@ class SimulationManager:
             logger.error(traceback.format_exc())
             state.status = SimulationStatus.FAILED
             state.error = str(e)
+            state.timings = {**(state.timings or {}), "simulation_prepare": timing.fail(str(e))}
             self._save_simulation_state(state)
             raise
     

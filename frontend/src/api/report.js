@@ -65,6 +65,19 @@ export const regenerateReportSection = (reportId, sectionIndex, data = {}) => {
 }
 
 /**
+ * Resume a failed or partial report from the first missing section
+ * @param {string} reportId
+ * @param {Object} data - { disable_interviews?, strict_antirepetition? }
+ */
+export const resumeReport = (reportId, data = {}) => {
+  return requestWithRetry(
+    () => service.post(`/api/report/${reportId}/resume`, data),
+    2,
+    1000
+  )
+}
+
+/**
  * Chat with Report Agent
  * @param {Object} data - { simulation_id, message, chat_history? }
  */

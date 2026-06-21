@@ -553,6 +553,9 @@ const formatTime = (timestamp) => {
 
 const renderMarkdown = (content) => {
   if (!content) return ''
+  if (typeof content !== 'string') {
+    content = content.response || content.answer || JSON.stringify(content, null, 2)
+  }
   
   let processedContent = content.replace(/^##\s+.+\n+/, '')
   let html = processedContent.replace(/```(\w*)\n([\s\S]*?)```/g, '<pre class="code-block"><code>$2</code></pre>')
@@ -695,9 +698,14 @@ const sendToReportAgent = async (message) => {
   })
 
   if (res.success && res.data) {
+    const agentResponse = res.data.response
+    const responseText = typeof agentResponse === 'string'
+      ? agentResponse
+      : (agentResponse?.response || agentResponse?.answer || res.data.answer || 'No response')
+
     chatHistory.value.push({
       role: 'assistant',
-      content: res.data.response || res.data.answer || 'No response',
+      content: responseText,
       timestamp: new Date().toISOString()
     })
     addLog('Report Agent replied')

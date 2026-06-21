@@ -62,16 +62,23 @@ class Config:
     DEFAULT_CHUNK_SIZE = int(os.environ.get('GRAPH_BUILD_CHUNK_SIZE', '3000'))
     DEFAULT_CHUNK_OVERLAP = int(os.environ.get('GRAPH_BUILD_CHUNK_OVERLAP', '200'))
     GRAPH_BUILD_BATCH_SIZE = int(os.environ.get('GRAPH_BUILD_BATCH_SIZE', '8'))
+    GRAPH_BUILD_MODE = os.environ.get('GRAPH_BUILD_MODE', 'accurate_fast')
+    GRAPH_BUILD_MAX_BATCH_CHARS = int(os.environ.get('GRAPH_BUILD_MAX_BATCH_CHARS', '18000'))
     # 0 means auto: local Ollama stays conservative, cloud providers use more concurrency.
     GRAPH_BUILD_LLM_CONCURRENCY = int(os.environ.get('GRAPH_BUILD_LLM_CONCURRENCY', '0'))
     GRAPH_BUILD_LOCAL_LLM_CONCURRENCY = int(os.environ.get('GRAPH_BUILD_LOCAL_LLM_CONCURRENCY', '1'))
-    GRAPH_BUILD_CLOUD_LLM_CONCURRENCY = int(os.environ.get('GRAPH_BUILD_CLOUD_LLM_CONCURRENCY', '3'))
+    GRAPH_BUILD_CLOUD_LLM_CONCURRENCY = int(os.environ.get('GRAPH_BUILD_CLOUD_LLM_CONCURRENCY', '5'))
     GRAPH_BUILD_BATCH_RETRIES = int(os.environ.get('GRAPH_BUILD_BATCH_RETRIES', '2'))
     GRAPH_BUILD_BATCH_RETRY_BASE_SECONDS = float(os.environ.get('GRAPH_BUILD_BATCH_RETRY_BASE_SECONDS', '2'))
     GRAPH_EXTRACTION_CACHE_ENABLED = os.environ.get('GRAPH_EXTRACTION_CACHE_ENABLED', 'True').lower() == 'true'
     GRAPH_EXTRACTION_CACHE_DIR = os.environ.get(
         'GRAPH_EXTRACTION_CACHE_DIR',
         os.path.join(UPLOAD_FOLDER, 'cache', 'ner_extractions')
+    )
+    GRAPH_EMBEDDING_CACHE_ENABLED = os.environ.get('GRAPH_EMBEDDING_CACHE_ENABLED', 'True').lower() == 'true'
+    GRAPH_EMBEDDING_CACHE_DIR = os.environ.get(
+        'GRAPH_EMBEDDING_CACHE_DIR',
+        os.path.join(UPLOAD_FOLDER, 'cache', 'embeddings')
     )
 
     # OASIS simulation configuration

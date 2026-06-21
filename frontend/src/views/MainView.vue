@@ -58,6 +58,7 @@
           :graphData="graphData"
           :systemLogs="systemLogs"
           @next-step="handleNextStep"
+          @update-build-settings="graphBuildSettings = $event"
         />
         <!-- Step 2: Env Setup -->
         <Step2EnvSetup
@@ -101,6 +102,13 @@ const error = ref('')
 const projectData = ref(null)
 const graphData = ref(null)
 const currentPhase = ref(-1) // -1: Upload, 0: Ontology, 1: Build, 2: Complete
+const graphBuildSettings = ref({
+  build_preset: 'fast_scan',
+  chunk_size: 4500,
+  chunk_overlap: 100,
+  batch_size: 8,
+  incremental: true
+})
 const ontologyProgress = ref(null)
 const buildProgress = ref(null)
 const systemLogs = ref([])
@@ -274,7 +282,10 @@ const startBuildGraph = async () => {
     buildProgress.value = { progress: 0, message: 'Starting build...', detail: {} }
     addLog('Initiating graph build...')
     
-    const res = await buildGraph({ project_id: currentProjectId.value })
+    const res = await buildGraph({
+      project_id: currentProjectId.value,
+      ...graphBuildSettings.value
+    })
     if (res.success) {
       addLog(`Graph build task started. Task ID: ${res.data.task_id}`)
       startGraphPolling({ intervalMs: 60000 })

@@ -125,6 +125,46 @@
             Based on the generated ontology, automatically chunk documents and invoke Neo4j to build knowledge graphs, extract entities and relationships, and form temporal memory and community summaries
           </p>
 
+          <div class="graph-build-controls">
+            <div class="controls-header">
+              <span>Build controls</span>
+              <span>{{ graphSettings.build_preset }}</span>
+            </div>
+            <div class="controls-grid">
+              <label>
+                <span>Preset</span>
+                <select v-model="graphSettings.build_preset" :disabled="currentPhase >= 1">
+                  <option value="fast_scan">Fast scan</option>
+                  <option value="balanced">Balanced</option>
+                  <option value="deep_evidence">Deep evidence</option>
+                </select>
+              </label>
+              <label>
+                <span>Chunk</span>
+                <input v-model.number="graphSettings.chunk_size" :disabled="currentPhase >= 1" type="number" min="500" />
+              </label>
+              <label>
+                <span>Overlap</span>
+                <input v-model.number="graphSettings.chunk_overlap" :disabled="currentPhase >= 1" type="number" min="0" />
+              </label>
+              <label>
+                <span>Batch</span>
+                <input v-model.number="graphSettings.batch_size" :disabled="currentPhase >= 1" type="number" min="1" />
+              </label>
+              <label>
+                <span>LLM x</span>
+                <input v-model.number="graphSettings.llm_concurrency" :disabled="currentPhase >= 1" type="number" min="1" placeholder="auto" />
+              </label>
+              <label>
+                <span>Incremental</span>
+                <select v-model="graphSettings.incremental" :disabled="currentPhase >= 1">
+                  <option :value="true">On</option>
+                  <option :value="false">Off</option>
+                </select>
+              </label>
+            </div>
+          </div>
+
           <div v-if="currentPhase === 1 && buildProgress" class="graph-progress">
             <div class="graph-progress-row">
               <span class="graph-progress-message">{{ buildProgress.message || 'Processing graph...' }}</span>
@@ -144,6 +184,10 @@
               <span>Embed {{ formatDuration(profileDetail.embedding_seconds) }}</span>
               <span>Neo4j {{ formatDuration(profileDetail.neo4j_write_seconds) }}</span>
               <span v-if="profileDetail.cache_hits !== undefined">Cache {{ profileDetail.cache_hits }}/{{ profileDetail.cache_hits + (profileDetail.cache_misses || 0) }}</span>
+            </div>
+            <div v-if="hasTiming" class="graph-progress-profile">
+              <span>Total {{ formatDuration(timingDetail.total_seconds) }}</span>
+              <span v-if="activeTimingPhase">Now {{ activeTimingPhase }}</span>
             </div>
           </div>
           
@@ -224,11 +268,32 @@ const props = defineProps({
   systemLogs: { type: Array, default: () => [] }
 })
 
-defineEmits(['next-step'])
+const emit = defineEmits(['next-step', 'update-build-settings'])
 
 const selectedOntologyItem = ref(null)
 const logContent = ref(null)
 const creatingSimulation = ref(false)
+const graphSettings = ref({
+  build_preset: 'fast_scan',
+  chunk_size: 4500,
+  chunk_overlap: 100,
+  batch_size: 8,
+  llm_concurrency: null,
+  incremental: true
+})
+
+watch(() => props.projectData?.graph_build_settings, (settings) => {
+  if (!settings) return
+  graphSettings.value = {
+    ...graphSettings.value,
+    ...settings,
+    build_preset: settings.build_preset || graphSettings.value.build_preset
+  }
+}, { immediate: true })
+
+watch(graphSettings, (settings) => {
+  emit('update-build-settings', { ...settings })
+}, { deep: true, immediate: true })
 
 // Enter environment setup - create simulation and navigate
 const handleEnterEnvSetup = async () => {
@@ -278,6 +343,12 @@ const graphStats = computed(() => {
 
 const progressDetail = computed(() => props.buildProgress?.detail || props.buildProgress?.progress_detail || {})
 const profileDetail = computed(() => progressDetail.value.profile || props.buildProgress?.result?.profile || {})
+const timingDetail = computed(() => (
+  progressDetail.value.timing
+  || profileDetail.value.timing
+  || props.buildProgress?.result?.timing
+  || {}
+))
 
 const hasChunkProgress = computed(() => {
   return progressDetail.value.current_chunk !== undefined && progressDetail.value.total_chunks
@@ -287,6 +358,13 @@ const hasProfile = computed(() => {
   return profileDetail.value.llm_extraction_seconds !== undefined
     || profileDetail.value.embedding_seconds !== undefined
     || profileDetail.value.neo4j_write_seconds !== undefined
+})
+
+const hasTiming = computed(() => timingDetail.value.total_seconds !== undefined)
+
+const activeTimingPhase = computed(() => {
+  const active = timingDetail.value.active_phases?.[0]
+  return active?.label || active?.name || ''
 })
 
 const formatDuration = (seconds) => {
@@ -616,6 +694,64 @@ watch(() => props.systemLogs.length, () => {
 }
 
 /* Step 02 Stats */
+.graph-build-controls {
+  margin-bottom: 14px;
+  padding: 12px;
+  border: 1px solid #E5E7EB;
+  border-radius: 6px;
+  background: #FBFBFB;
+}
+
+.controls-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 10px;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  color: #111827;
+}
+
+.controls-header span:last-child {
+  color: #047857;
+  background: #ECFDF5;
+  border: 1px solid #A7F3D0;
+  border-radius: 4px;
+  padding: 2px 7px;
+}
+
+.controls-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.controls-grid label {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.controls-grid label span {
+  font-size: 10px;
+  font-weight: 700;
+  color: #6B7280;
+  text-transform: uppercase;
+}
+
+.controls-grid input,
+.controls-grid select {
+  width: 100%;
+  min-width: 0;
+  border: 1px solid #D1D5DB;
+  border-radius: 5px;
+  background: #FFFFFF;
+  color: #111827;
+  font-size: 12px;
+  padding: 8px;
+}
+
 .graph-progress {
   margin-bottom: 14px;
   padding: 12px;

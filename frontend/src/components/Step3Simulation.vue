@@ -88,6 +88,22 @@
             </div>
           </div>
         </div>
+
+        <div v-if="runTiming" class="platform-status runtime" :class="{ active: runStatus.runner_status === 'running', completed: runStatus.runner_status === 'completed' }">
+          <div class="platform-header">
+            <span class="platform-name">Runtime</span>
+          </div>
+          <div class="platform-stats">
+            <span class="stat">
+              <span class="stat-label">WALL</span>
+              <span class="stat-value mono">{{ formatWallDuration(runTiming.total_seconds || runTiming.duration_seconds) }}</span>
+            </span>
+            <span class="stat">
+              <span class="stat-label">STATUS</span>
+              <span class="stat-value mono">{{ runStatus.runner_status || 'idle' }}</span>
+            </span>
+          </div>
+        </div>
       </div>
 
       <div class="action-controls">
@@ -269,6 +285,49 @@
       </div>
     </div>
 
+    <div v-if="diagnostics" class="diagnostics-panel">
+      <div class="diagnostics-header">
+        <span class="diagnostics-title">Agent Diagnostics</span>
+        <span class="diagnostics-badge">{{ diagnostics.quality_report?.recommended_next_run || 'none' }}</span>
+      </div>
+      <div class="diagnostics-grid">
+        <div class="diagnostic-metric">
+          <span class="metric-value mono">{{ diagnostics.summary?.actions_count || 0 }}</span>
+          <span class="metric-label">Actions</span>
+        </div>
+        <div class="diagnostic-metric">
+          <span class="metric-value mono">{{ diagnostics.summary?.useful_actions_count || 0 }}</span>
+          <span class="metric-label">Useful</span>
+        </div>
+        <div class="diagnostic-metric">
+          <span class="metric-value mono">{{ diagnostics.off_track_agents?.length || 0 }}</span>
+          <span class="metric-label">Off Track</span>
+        </div>
+        <div class="diagnostic-metric">
+          <span class="metric-value mono">{{ diagnostics.high_impact_agents?.length || 0 }}</span>
+          <span class="metric-label">High Impact</span>
+        </div>
+      </div>
+      <div class="diagnostics-lists">
+        <div class="diagnostics-list">
+          <span class="list-title">High-impact agents</span>
+          <div v-for="agent in (diagnostics.high_impact_agents || []).slice(0, 4)" :key="`impact-${agent.agent_id}`" class="list-row">
+            <span>{{ agent.agent_name }}</span>
+            <span class="mono">{{ agent.influence_score }}</span>
+          </div>
+          <div v-if="!(diagnostics.high_impact_agents || []).length" class="list-empty">No high-impact agents yet</div>
+        </div>
+        <div class="diagnostics-list">
+          <span class="list-title">Issues</span>
+          <div v-for="agent in (diagnostics.off_track_agents || []).slice(0, 4)" :key="`off-${agent.agent_id}`" class="list-row">
+            <span>{{ agent.agent_name }}</span>
+            <span class="mono">{{ Math.round((agent.off_topic_rate || 0) * 100) }}%</span>
+          </div>
+          <div v-if="!(diagnostics.off_track_agents || []).length" class="list-empty">No off-track agents flagged</div>
+        </div>
+      </div>
+    </div>
+
     <!-- Bottom Info / Logs -->
     <div class="system-logs">
       <div class="log-header">
@@ -292,7 +351,8 @@ import {
   startSimulation, 
   stopSimulation,
   getRunStatus, 
-  getRunStatusDetail
+  getRunStatusDetail,
+  getRunDiagnostics
 } from '../api/simulation'
 import { generateReport } from '../api/report'
 
@@ -319,6 +379,7 @@ const isStarting = ref(false)
 const isStopping = ref(false)
 const startError = ref(null)
 const runStatus = ref({})
+const diagnostics = ref(null)
 const allActions = ref([]) // All actions (incremental accumulation)
 const actionIds = ref(new Set()) // Action IDs set for deduplication
 const scrollContainer = ref(null)
@@ -337,6 +398,20 @@ const twitterActionsCount = computed(() => {
 const redditActionsCount = computed(() => {
   return allActions.value.filter(a => a.platform === 'reddit').length
 })
+
+const runTiming = computed(() => runStatus.value.timing?.run || null)
+
+const formatWallDuration = (seconds) => {
+  if (seconds === null || seconds === undefined || Number.isNaN(Number(seconds))) return '--'
+  const totalSeconds = Math.max(0, Math.round(Number(seconds)))
+  const minutes = Math.floor(totalSeconds / 60)
+  const remainingSeconds = totalSeconds % 60
+  const hours = Math.floor(minutes / 60)
+  const remainingMinutes = minutes % 60
+  if (hours > 0) return `${hours}h ${remainingMinutes}m`
+  if (minutes > 0) return `${minutes}m ${remainingSeconds}s`
+  return `${remainingSeconds}s`
+}
 
 // Format simulated elapsed time (calculated based on rounds and minutes per round)
 const formatElapsedTime = (currentRound) => {
@@ -366,6 +441,7 @@ const addLog = (msg) => {
 const resetAllState = () => {
   phase.value = 0
   runStatus.value = {}
+  diagnostics.value = null
   allActions.value = []
   actionIds.value = new Set()
   prevTwitterRound.value = 0
@@ -396,10 +472,10 @@ const doStartSimulation = async () => {
       simulation_id: props.simulationId,
       platform: 'parallel',
       force: true,  // Force restart
-      enable_graph_memory_update: true,  // Enable dynamic graph update
+      enable_graph_memory_update: false,  // Faster run: skip live graph memory writes
       scenario_id: 'baseline',
       seed: Date.now() % 1000000,
-      memory_mode: 'practical'
+      memory_mode: 'off'
     }
 
     if (props.maxRounds) {
@@ -407,7 +483,7 @@ const doStartSimulation = async () => {
       addLog(`Set max simulation rounds: ${props.maxRounds}`)
     }
 
-    addLog('Dynamic graph update mode enabled')
+    addLog('Fast runtime mode enabled: forecast memory and live graph updates disabled')
 
     const res = await startSimulation(params)
 
@@ -451,6 +527,7 @@ const handleStopSimulation = async () => {
       addLog('✓ Simulation stopped')
       phase.value = 2
       stopPolling()
+      loadDiagnostics()
       emit('update-status', 'completed')
     } else {
       addLog(`Stop failed: ${res.error || 'Unknown error'}`)
@@ -525,11 +602,29 @@ const fetchRunStatus = async () => {
         addLog('✓ Simulation completed')
         phase.value = 2
         stopPolling()
+        loadDiagnostics()
         emit('update-status', 'completed')
       }
     }
   } catch (err) {
     console.warn('Failed to fetch run status:', err)
+  }
+}
+
+const loadDiagnostics = async () => {
+  if (!props.simulationId) return
+  try {
+    const res = await getRunDiagnostics(props.simulationId)
+    if (res.success && res.data) {
+      diagnostics.value = res.data
+      const quality = res.data.quality_report || {}
+      addLog(`Run diagnostics: ${res.data.summary?.actions_count || 0} actions, ${res.data.off_track_agents?.length || 0} off-track agents`)
+      if (quality.recommended_next_run && quality.recommended_next_run !== 'none') {
+        addLog(`Run quality recommendation: ${quality.recommended_next_run}`)
+      }
+    }
+  } catch (err) {
+    console.warn('Failed to fetch diagnostics:', err)
   }
 }
 
@@ -908,6 +1003,101 @@ onUnmounted(() => {
   overflow-y: auto;
   position: relative;
   background: #FFF;
+}
+
+.diagnostics-panel {
+  border-top: 1px solid #EAEAEA;
+  background: #FFFFFF;
+  padding: 12px 24px;
+}
+
+.diagnostics-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 10px;
+}
+
+.diagnostics-title {
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+  color: #111827;
+}
+
+.diagnostics-badge {
+  font-size: 10px;
+  font-weight: 700;
+  color: #047857;
+  background: #ECFDF5;
+  border: 1px solid #A7F3D0;
+  border-radius: 4px;
+  padding: 3px 8px;
+  text-transform: uppercase;
+}
+
+.diagnostics-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.diagnostic-metric {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  border: 1px solid #E5E7EB;
+  border-radius: 4px;
+  padding: 8px;
+  background: #FBFBFB;
+}
+
+.metric-value {
+  font-size: 16px;
+  font-weight: 700;
+  color: #111827;
+}
+
+.metric-label {
+  font-size: 10px;
+  text-transform: uppercase;
+  color: #6B7280;
+}
+
+.diagnostics-lists {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.diagnostics-list {
+  border: 1px solid #E5E7EB;
+  border-radius: 4px;
+  padding: 8px;
+}
+
+.list-title {
+  display: block;
+  font-size: 10px;
+  font-weight: 700;
+  color: #6B7280;
+  text-transform: uppercase;
+  margin-bottom: 6px;
+}
+
+.list-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 12px;
+  color: #111827;
+  padding: 3px 0;
+}
+
+.list-empty {
+  font-size: 12px;
+  color: #9CA3AF;
 }
 
 /* Timeline Header */

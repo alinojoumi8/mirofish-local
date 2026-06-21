@@ -12,6 +12,7 @@ from dataclasses import dataclass
 
 from ..config import Config
 from ..models.task import TaskManager, TaskStatus
+from ..models.case import normalize_graph_build_settings
 from ..storage import GraphStorage
 from ..storage.extraction_cache import ExtractionCache
 from .text_processor import TextProcessor
@@ -46,6 +47,45 @@ class GraphBuilderService:
         self.storage = storage
         self.task_manager = TaskManager()
         self.last_build_profile: Dict[str, Any] = {}
+
+    @staticmethod
+    def resolve_build_settings(raw: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Normalize graph build presets and explicit overrides."""
+        return normalize_graph_build_settings(raw)
+
+    @staticmethod
+    def split_documents_with_provenance(
+        documents: List[Dict[str, Any]],
+        chunk_size: int = Config.DEFAULT_CHUNK_SIZE,
+        chunk_overlap: int = Config.DEFAULT_CHUNK_OVERLAP,
+    ) -> List[Dict[str, Any]]:
+        """
+        Split documents without flattening boundaries.
+
+        Returns rows shaped as {"text": chunk_text, "metadata": provenance}.
+        """
+        rows: List[Dict[str, Any]] = []
+        for document in documents or []:
+            text = document.get("text") or document.get("content") or ""
+            if not text.strip():
+                continue
+            chunks = TextProcessor.split_text(text, chunk_size=chunk_size, overlap=chunk_overlap)
+            for idx, chunk in enumerate(chunks):
+                metadata = {
+                    "case_id": document.get("case_id"),
+                    "version_id": document.get("version_id") or document.get("case_version_id"),
+                    "document_id": document.get("document_id"),
+                    "filename": document.get("filename"),
+                    "document_type": document.get("document_type") or "other",
+                    "chunk_index": idx,
+                    "page": document.get("page"),
+                    "paragraph": document.get("paragraph"),
+                }
+                rows.append({
+                    "text": chunk,
+                    "metadata": {k: v for k, v in metadata.items() if v is not None},
+                })
+        return rows
 
     def build_graph_async(
         self,
@@ -200,6 +240,8 @@ class GraphBuilderService:
         batch_size: int = 3,
         progress_callback: Optional[Callable] = None,
         cache_context: Optional[Dict[str, Any]] = None,
+        llm_concurrency_override: Optional[int] = None,
+        chunk_metadata: Optional[List[Dict[str, Any]]] = None,
     ) -> List[str]:
         """Add text in batches to graph, return uuid list of all episodes"""
         total_chunks = len(chunks)
@@ -212,8 +254,14 @@ class GraphBuilderService:
             )
             return []
         batch_size = max(1, int(batch_size))
-        total_batches = (total_chunks + batch_size - 1) // batch_size
-        llm_concurrency = self._resolve_llm_concurrency(total_batches)
+        batch_jobs = self._build_batch_jobs(chunks, batch_size)
+        if chunk_metadata is not None:
+            for job in batch_jobs:
+                start = max(0, int(job["first_chunk"]) - 1)
+                end = int(job["last_chunk"])
+                job["chunk_metadata"] = chunk_metadata[start:end]
+        total_batches = len(batch_jobs)
+        llm_concurrency = self._resolve_llm_concurrency(total_batches, override=llm_concurrency_override)
         started_at = time.perf_counter()
         profile = self._new_build_profile(
             total_chunks=total_chunks,
@@ -221,7 +269,6 @@ class GraphBuilderService:
             batch_size=batch_size,
             llm_concurrency=llm_concurrency,
         )
-        batch_jobs = []
 
         logger.info(
             "[graph_build] Starting: %s chunks, %s batches (batch_size=%s, concurrency=%s)",
@@ -230,19 +277,6 @@ class GraphBuilderService:
             batch_size,
             llm_concurrency,
         )
-
-        for i in range(0, total_chunks, batch_size):
-            batch_chunks = chunks[i:i + batch_size]
-            batch_num = i // batch_size + 1
-            batch_jobs.append(
-                {
-                    "batch_index": batch_num - 1,
-                    "batch_num": batch_num,
-                    "first_chunk": i + 1,
-                    "last_chunk": i + len(batch_chunks),
-                    "chunks": batch_chunks,
-                }
-            )
 
         processed_chunks = 0
         results_by_batch: Dict[int, List[str]] = {}
@@ -256,6 +290,7 @@ class GraphBuilderService:
                     job["batch_num"],
                     total_batches,
                     cache_context,
+                    job.get("chunk_metadata"),
                 ): job
                 for job in batch_jobs
             }
@@ -338,6 +373,7 @@ class GraphBuilderService:
         batch_num: int,
         total_batches: int,
         cache_context: Optional[Dict[str, Any]],
+        chunk_metadata: Optional[List[Dict[str, Any]]] = None,
     ) -> tuple[List[str], Dict[str, Any], float]:
         """Run one storage batch with retry/backoff and return ids, profile, elapsed seconds."""
         first_chunk = batch_num
@@ -355,13 +391,14 @@ class GraphBuilderService:
                     attempts,
                     len(batch_chunks),
                 )
-                batch_episode_ids = self.storage.add_text_batch(
-                    graph_id,
-                    batch_chunks,
-                    batch_size=len(batch_chunks),
-                    cache_context=cache_context,
-                    profile_callback=batch_profile.update,
-                )
+                kwargs = {
+                    "batch_size": len(batch_chunks),
+                    "cache_context": cache_context,
+                    "profile_callback": batch_profile.update,
+                }
+                if chunk_metadata is not None:
+                    kwargs["chunk_metadata"] = chunk_metadata
+                batch_episode_ids = self.storage.add_text_batch(graph_id, batch_chunks, **kwargs)
                 return batch_episode_ids, batch_profile, time.perf_counter() - t0
             except Exception as e:
                 last_error = e
@@ -387,9 +424,11 @@ class GraphBuilderService:
                 time.sleep(wait_seconds)
         raise last_error or RuntimeError(f"Batch {first_chunk} failed")
 
-    def _resolve_llm_concurrency(self, total_batches: int) -> int:
+    def _resolve_llm_concurrency(self, total_batches: int, override: Optional[int] = None) -> int:
         if total_batches <= 0:
             return 0
+        if override is not None:
+            return max(1, min(int(override), total_batches))
         configured = int(getattr(Config, "GRAPH_BUILD_LLM_CONCURRENCY", 0) or 0)
         if configured > 0:
             return max(1, min(configured, total_batches))
@@ -408,6 +447,47 @@ class GraphBuilderService:
             else getattr(Config, "GRAPH_BUILD_CLOUD_LLM_CONCURRENCY", 3)
         )
         return max(1, min(int(fallback), total_batches))
+
+    def _build_batch_jobs(self, chunks: List[str], batch_size: int) -> List[Dict[str, Any]]:
+        """Pack chunks by max chunk count and prompt character budget."""
+        batch_size = max(1, int(batch_size))
+        max_chars = max(1, int(getattr(Config, "GRAPH_BUILD_MAX_BATCH_CHARS", 18000)))
+        jobs: List[Dict[str, Any]] = []
+        current_chunks: List[str] = []
+        current_chars = 0
+        first_chunk_index = 0
+
+        def flush() -> None:
+            nonlocal current_chunks, current_chars, first_chunk_index
+            if not current_chunks:
+                return
+            batch_num = len(jobs) + 1
+            last_chunk_index = first_chunk_index + len(current_chunks) - 1
+            jobs.append({
+                "batch_index": batch_num - 1,
+                "batch_num": batch_num,
+                "first_chunk": first_chunk_index + 1,
+                "last_chunk": last_chunk_index + 1,
+                "chunks": current_chunks,
+            })
+            current_chunks = []
+            current_chars = 0
+            first_chunk_index = last_chunk_index + 1
+
+        for idx, chunk in enumerate(chunks):
+            chunk_chars = len(chunk or "")
+            if not current_chunks:
+                first_chunk_index = idx
+            would_exceed_count = len(current_chunks) >= batch_size
+            would_exceed_chars = current_chunks and (current_chars + chunk_chars > max_chars)
+            if would_exceed_count or would_exceed_chars:
+                flush()
+                first_chunk_index = idx
+            current_chunks.append(chunk)
+            current_chars += chunk_chars
+
+        flush()
+        return jobs
 
     def _new_build_profile(
         self,

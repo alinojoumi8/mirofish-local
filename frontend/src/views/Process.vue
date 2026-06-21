@@ -444,6 +444,13 @@ const graphData = ref(null)
 const buildProgress = ref(null)
 const ontologyProgress = ref(null) // Ontology generation progress
 const currentPhase = ref(-1) // -1: Uploading, 0: Generating ontology, 1: Building graph, 2: Complete
+const graphBuildSettings = ref({
+  build_preset: 'fast_scan',
+  chunk_size: 4500,
+  chunk_overlap: 100,
+  batch_size: 8,
+  incremental: true
+})
 const selectedItem = ref(null) // Selected node or edge
 const isFullScreen = ref(false)
 
@@ -707,7 +714,10 @@ const startBuildGraph = async () => {
       detail: {}
     }
 
-    const response = await buildGraph({ project_id: currentProjectId.value })
+    const response = await buildGraph({
+      project_id: currentProjectId.value,
+      ...graphBuildSettings.value
+    })
 
     if (response.success) {
       buildProgress.value.message = 'Graph build task started...'

@@ -143,6 +143,22 @@ export const getAgentStats = (simulationId) => {
   return service.get(`/api/simulation/${simulationId}/agent-stats`)
 }
 
+export const getRunDiagnostics = (simulationId) => {
+  return service.get(`/api/simulation/${simulationId}/diagnostics`)
+}
+
+export const getAgentDiagnostics = (simulationId, params = {}) => {
+  return service.get(`/api/simulation/${simulationId}/diagnostics/agents`, { params })
+}
+
+export const getTopicDiagnostics = (simulationId) => {
+  return service.get(`/api/simulation/${simulationId}/diagnostics/topics`)
+}
+
+export const getOffTrackAgents = (simulationId) => {
+  return service.get(`/api/simulation/${simulationId}/diagnostics/off-track`)
+}
+
 /**
  * Get simulation action history
  * @param {string} simulationId
@@ -184,4 +200,3 @@ export const interviewAgents = (data) => {
 export const getSimulationHistory = (limit = 20) => {
   return service.get('/api/simulation/history', { params: { limit } })
 }
-

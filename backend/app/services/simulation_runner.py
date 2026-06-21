@@ -12,6 +12,7 @@ import threading
 import subprocess
 import signal
 import atexit
+from collections import Counter, defaultdict
 from typing import Dict, Any, List, Optional, Union
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -20,6 +21,7 @@ from queue import Queue
 
 from ..config import Config
 from ..utils.logger import get_logger
+from ..utils.timing import PhaseTimer, wall_clock_timing
 from .graph_memory_updater import GraphMemoryManager
 from .simulation_ipc import SimulationIPCClient, CommandType, IPCResponse
 
@@ -142,6 +144,7 @@ class SimulationRunState:
 
     # Process ID (for stopping)
     process_pid: Optional[int] = None
+    timing: Dict[str, Any] = field(default_factory=dict)
     
     def add_action(self, action: AgentAction):
         """Add action to recent actions list"""
@@ -157,6 +160,15 @@ class SimulationRunState:
         self.updated_at = datetime.now().isoformat()
     
     def to_dict(self) -> Dict[str, Any]:
+        timing = dict(self.timing or {})
+        if self.started_at:
+            timing["run"] = wall_clock_timing(
+                "run",
+                self.started_at,
+                self.completed_at,
+                status=self.runner_status.value,
+            )
+
         return {
             "simulation_id": self.simulation_id,
             "runner_status": self.runner_status.value,
@@ -182,6 +194,7 @@ class SimulationRunState:
             "completed_at": self.completed_at,
             "error": self.error,
             "process_pid": self.process_pid,
+            "timing": timing,
         }
 
     def to_detail_dict(self) -> Dict[str, Any]:
@@ -272,6 +285,7 @@ class SimulationRunner:
                 completed_at=data.get("completed_at"),
                 error=data.get("error"),
                 process_pid=data.get("process_pid"),
+                timing=data.get("timing", {}),
             )
 
             # Load recent actions
@@ -334,6 +348,14 @@ class SimulationRunner:
         Returns:
             SimulationRunState
         """
+        startup_timing = PhaseTimer("simulation_start", metadata={
+            "simulation_id": simulation_id,
+            "platform": platform,
+            "max_rounds": max_rounds,
+            "scenario_id": scenario_id,
+            "memory_mode": memory_mode,
+        })
+
         # Check if already running
         existing = cls.get_run_state(simulation_id)
         if existing and existing.runner_status in [RunnerStatus.RUNNING, RunnerStatus.STARTING]:
@@ -343,28 +365,30 @@ class SimulationRunner:
         sim_dir = os.path.join(cls.RUN_STATE_DIR, simulation_id)
         config_path = os.path.join(sim_dir, "simulation_config.json")
         
-        if not os.path.exists(config_path):
-            raise ValueError(f"Simulation config does not exist, call /prepare endpoint first")
-        
-        with open(config_path, 'r', encoding='utf-8') as f:
-            config = json.load(f)
+        with startup_timing.time("load_config", label="Load simulation config"):
+            if not os.path.exists(config_path):
+                raise ValueError(f"Simulation config does not exist, call /prepare endpoint first")
 
-        config_changed = False
-        if scenario_id:
-            config["active_scenario_id"] = scenario_id
-            config_changed = True
-        if seed is not None:
-            try:
-                config["seed"] = int(seed)
-            except (TypeError, ValueError):
-                config["seed"] = str(seed)
-            config_changed = True
-        if memory_mode:
-            config["memory_mode"] = memory_mode
-            config_changed = True
-        if config_changed:
-            with open(config_path, 'w', encoding='utf-8') as f:
-                json.dump(config, f, ensure_ascii=False, indent=2)
+            with open(config_path, 'r', encoding='utf-8') as f:
+                config = json.load(f)
+
+        with startup_timing.time("apply_overrides", label="Apply run overrides"):
+            config_changed = False
+            if scenario_id:
+                config["active_scenario_id"] = scenario_id
+                config_changed = True
+            if seed is not None:
+                try:
+                    config["seed"] = int(seed)
+                except (TypeError, ValueError):
+                    config["seed"] = str(seed)
+                config_changed = True
+            if memory_mode:
+                config["memory_mode"] = memory_mode
+                config_changed = True
+            if config_changed:
+                with open(config_path, 'w', encoding='utf-8') as f:
+                    json.dump(config, f, ensure_ascii=False, indent=2)
         
         # Initialize run state
         time_config = config.get("time_config", {})
@@ -379,49 +403,53 @@ class SimulationRunner:
             if total_rounds < original_rounds:
                 logger.info(f"Rounds truncated: {original_rounds} -> {total_rounds} (max_rounds={max_rounds})")
         
-        state = SimulationRunState(
-            simulation_id=simulation_id,
-            runner_status=RunnerStatus.STARTING,
-            total_rounds=total_rounds,
-            total_simulation_hours=total_hours,
-            started_at=datetime.now().isoformat(),
-        )
+        with startup_timing.time("initialize_run_state", label="Initialize run state"):
+            state = SimulationRunState(
+                simulation_id=simulation_id,
+                runner_status=RunnerStatus.STARTING,
+                total_rounds=total_rounds,
+                total_simulation_hours=total_hours,
+                started_at=datetime.now().isoformat(),
+            )
+            state.timing = {**(state.timing or {}), "startup": startup_timing.snapshot()}
         
         cls._save_run_state(state)
         
         # If graph memory update enabled, create updater
-        if enable_graph_memory_update:
-            if not graph_id:
-                raise ValueError("Must provide graph_id when enabling graph memory update")
-            
-            try:
-                if not storage:
-                    raise ValueError("Must provide storage (GraphStorage) when enabling graph memory update")
-                GraphMemoryManager.create_updater(simulation_id, graph_id, storage)
-                cls._graph_memory_enabled[simulation_id] = True
-                logger.info(f"Graph memory update enabled: simulation_id={simulation_id}, graph_id={graph_id}")
-            except Exception as e:
-                logger.error(f"Failed to create graph memory updater: {e}")
+        with startup_timing.time("graph_memory_setup", label="Configure graph memory"):
+            if enable_graph_memory_update:
+                if not graph_id:
+                    raise ValueError("Must provide graph_id when enabling graph memory update")
+
+                try:
+                    if not storage:
+                        raise ValueError("Must provide storage (GraphStorage) when enabling graph memory update")
+                    GraphMemoryManager.create_updater(simulation_id, graph_id, storage)
+                    cls._graph_memory_enabled[simulation_id] = True
+                    logger.info(f"Graph memory update enabled: simulation_id={simulation_id}, graph_id={graph_id}")
+                except Exception as e:
+                    logger.error(f"Failed to create graph memory updater: {e}")
+                    cls._graph_memory_enabled[simulation_id] = False
+            else:
                 cls._graph_memory_enabled[simulation_id] = False
-        else:
-            cls._graph_memory_enabled[simulation_id] = False
         
         # Determine which script to run (scripts located in backend/scripts/ directory)
-        if platform == "twitter":
-            script_name = "run_twitter_simulation.py"
-            state.twitter_running = True
-        elif platform == "reddit":
-            script_name = "run_reddit_simulation.py"
-            state.reddit_running = True
-        else:
-            script_name = "run_parallel_simulation.py"
-            state.twitter_running = True
-            state.reddit_running = True
-        
-        script_path = os.path.join(cls.SCRIPTS_DIR, script_name)
-        
-        if not os.path.exists(script_path):
-            raise ValueError(f"Script does not exist: {script_path}")
+        with startup_timing.time("select_script", label="Select simulation script"):
+            if platform == "twitter":
+                script_name = "run_twitter_simulation.py"
+                state.twitter_running = True
+            elif platform == "reddit":
+                script_name = "run_reddit_simulation.py"
+                state.reddit_running = True
+            else:
+                script_name = "run_parallel_simulation.py"
+                state.twitter_running = True
+                state.reddit_running = True
+
+            script_path = os.path.join(cls.SCRIPTS_DIR, script_name)
+
+            if not os.path.exists(script_path):
+                raise ValueError(f"Script does not exist: {script_path}")
         
         # Create action queue
         action_queue = Queue()
@@ -457,17 +485,18 @@ class SimulationRunner:
             
             # Set working directory to simulation directory (database files etc. will be generated here)
             # Use start_new_session=True to create new process group, ensuring all child processes can be terminated via os.killpg
-            process = subprocess.Popen(
-                cmd,
-                cwd=sim_dir,
-                stdout=main_log_file,
-                stderr=subprocess.STDOUT,  # stderr also written to same file
-                text=True,
-                encoding='utf-8',  # Explicitly specify encoding
-                bufsize=1,
-                env=env,  # Pass environment variables with UTF-8 settings
-                start_new_session=True,  # Create new process group, ensure all related processes terminate when server closes
-            )
+            with startup_timing.time("launch_process", label="Launch simulation process"):
+                process = subprocess.Popen(
+                    cmd,
+                    cwd=sim_dir,
+                    stdout=main_log_file,
+                    stderr=subprocess.STDOUT,  # stderr also written to same file
+                    text=True,
+                    encoding='utf-8',  # Explicitly specify encoding
+                    bufsize=1,
+                    env=env,  # Pass environment variables with UTF-8 settings
+                    start_new_session=True,  # Create new process group, ensure all related processes terminate when server closes
+                )
             
             # Save file handle for later closing
             cls._stdout_files[simulation_id] = main_log_file
@@ -475,6 +504,10 @@ class SimulationRunner:
             
             state.process_pid = process.pid
             state.runner_status = RunnerStatus.RUNNING
+            state.timing = {
+                **(state.timing or {}),
+                "startup": startup_timing.complete(metadata={"process_pid": process.pid}),
+            }
             cls._processes[simulation_id] = process
             cls._save_run_state(state)
             
@@ -492,6 +525,7 @@ class SimulationRunner:
         except Exception as e:
             state.runner_status = RunnerStatus.FAILED
             state.error = str(e)
+            state.timing = {**(state.timing or {}), "startup": startup_timing.fail(str(e))}
             cls._save_run_state(state)
             raise
         
@@ -1116,6 +1150,260 @@ class SimulationRunner:
         result = sorted(agent_stats.values(), key=lambda x: x["total_actions"], reverse=True)
         
         return result
+
+    @classmethod
+    def get_run_diagnostics(cls, simulation_id: str) -> Dict[str, Any]:
+        """Summarize large agent runs into readable diagnostics."""
+        actions = cls.get_all_actions(simulation_id)
+        summary = cls._diagnostics_summary(actions)
+        agents = cls._diagnostics_by_agent(actions)
+        rounds = cls._diagnostics_by_round(actions)
+        platforms = cls._diagnostics_by_platform(actions)
+        topics = cls._diagnostics_by_topic(actions)
+        off_track_agents = [
+            agent for agent in agents
+            if agent["off_topic_rate"] >= 0.5
+            or agent["repetitive_action_rate"] >= 0.4
+            or agent["failed_actions"] > 0
+        ]
+        high_impact_agents = [
+            agent for agent in agents
+            if agent["influence_score"] >= max(3, summary["actions_count"] * 0.25)
+        ]
+        quality_report = cls._diagnostics_quality_report(
+            summary=summary,
+            agents=agents,
+            off_track_agents=off_track_agents,
+            topics=topics,
+        )
+        return {
+            "simulation_id": simulation_id,
+            "summary": summary,
+            "agents": agents,
+            "entity_types": {},
+            "stances": {},
+            "rounds": rounds,
+            "platforms": platforms,
+            "topics": topics,
+            "off_track_agents": off_track_agents,
+            "high_impact_agents": high_impact_agents,
+            "quality_report": quality_report,
+        }
+
+    @classmethod
+    def _diagnostics_summary(cls, actions: List[AgentAction]) -> Dict[str, Any]:
+        actions_count = len(actions)
+        failed_actions = sum(1 for action in actions if not action.success)
+        useful_actions = sum(
+            1 for action in actions
+            if action.success and action.action_type not in {"DO_NOTHING", "IDLE", ""}
+        )
+        generic = sum(1 for action in actions if cls._is_generic_or_off_topic(cls._action_content(action)))
+        contradictory = sum(1 for action in actions if cls._is_contradictory(cls._action_content(action)))
+        return {
+            "actions_count": actions_count,
+            "useful_actions_count": useful_actions,
+            "failed_actions": failed_actions,
+            "inactive_agents": 0,
+            "repetitive_generic_action_rate": round(generic / actions_count, 4) if actions_count else 0.0,
+            "off_topic_rate": round(generic / actions_count, 4) if actions_count else 0.0,
+            "contradiction_rate": round(contradictory / actions_count, 4) if actions_count else 0.0,
+        }
+
+    @classmethod
+    def _diagnostics_by_agent(cls, actions: List[AgentAction]) -> List[Dict[str, Any]]:
+        grouped: Dict[int, List[AgentAction]] = defaultdict(list)
+        for action in actions:
+            grouped[action.agent_id].append(action)
+
+        rows = []
+        for agent_id, agent_actions in grouped.items():
+            total = len(agent_actions)
+            content_counter = Counter(cls._action_content(action).strip().lower() for action in agent_actions)
+            repeated = sum(count for text, count in content_counter.items() if text and count > 1)
+            generic = sum(1 for action in agent_actions if cls._is_generic_or_off_topic(cls._action_content(action)))
+            failed = sum(1 for action in agent_actions if not action.success)
+            useful = sum(
+                1 for action in agent_actions
+                if action.success and action.action_type not in {"DO_NOTHING", "IDLE", ""}
+            )
+            platforms = Counter(action.platform for action in agent_actions)
+            rounds = {action.round_num for action in agent_actions if action.round_num}
+            content = " ".join(cls._action_content(action) for action in agent_actions)
+            rows.append({
+                "agent_id": agent_id,
+                "agent_name": next((a.agent_name for a in agent_actions if a.agent_name), f"Agent {agent_id}"),
+                "entity_type": "",
+                "stance": cls._infer_stance(content),
+                "actions_count": total,
+                "useful_actions_count": useful,
+                "failed_actions": failed,
+                "platforms": dict(platforms),
+                "rounds_active": sorted(rounds),
+                "action_types": dict(Counter(action.action_type for action in agent_actions)),
+                "repetitive_action_rate": round(repeated / total, 4) if total else 0.0,
+                "generic_action_rate": round(generic / total, 4) if total else 0.0,
+                "off_topic_rate": round(generic / total, 4) if total else 0.0,
+                "contradiction_rate": round(
+                    sum(1 for action in agent_actions if cls._is_contradictory(cls._action_content(action))) / total,
+                    4,
+                ) if total else 0.0,
+                "sentiment_stance_drift": cls._infer_sentiment_drift(agent_actions),
+                "influence_score": round(useful + len(rounds) + max(platforms.values() or [0]) * 0.5, 4),
+                "evidence_relevance_score": cls._evidence_relevance_score(content),
+            })
+
+        rows.sort(key=lambda row: (row["actions_count"], row["failed_actions"], row["off_topic_rate"]), reverse=True)
+        return rows
+
+    @classmethod
+    def _diagnostics_by_round(cls, actions: List[AgentAction]) -> List[Dict[str, Any]]:
+        grouped: Dict[int, List[AgentAction]] = defaultdict(list)
+        for action in actions:
+            grouped[action.round_num].append(action)
+        return [
+            {
+                "round_num": round_num,
+                "actions_count": len(round_actions),
+                "failed_actions": sum(1 for action in round_actions if not action.success),
+                "active_agents": sorted({action.agent_id for action in round_actions}),
+                "platforms": dict(Counter(action.platform for action in round_actions)),
+                "action_types": dict(Counter(action.action_type for action in round_actions)),
+            }
+            for round_num, round_actions in sorted(grouped.items())
+        ]
+
+    @classmethod
+    def _diagnostics_by_platform(cls, actions: List[AgentAction]) -> Dict[str, Dict[str, Any]]:
+        grouped: Dict[str, List[AgentAction]] = defaultdict(list)
+        for action in actions:
+            grouped[action.platform or "unknown"].append(action)
+        return {
+            platform: {
+                "actions_count": len(platform_actions),
+                "failed_actions": sum(1 for action in platform_actions if not action.success),
+                "active_agents": len({action.agent_id for action in platform_actions}),
+                "action_types": dict(Counter(action.action_type for action in platform_actions)),
+            }
+            for platform, platform_actions in grouped.items()
+        }
+
+    @classmethod
+    def _diagnostics_by_topic(cls, actions: List[AgentAction]) -> Dict[str, Dict[str, Any]]:
+        topics = {
+            "evidence": {"evidence", "affidavit", "exhibit", "proof", "record"},
+            "procedure": {"motion", "hearing", "appeal", "deadline", "order", "court"},
+            "settlement": {"settlement", "offer", "without prejudice", "resolve"},
+            "damages": {"damages", "loss", "quantum", "remedy"},
+            "credibility": {"credibility", "inconsistent", "contradiction", "witness"},
+        }
+        result: Dict[str, Dict[str, Any]] = {}
+        for action in actions:
+            if not action.success:
+                continue
+            content = cls._action_content(action).lower()
+            for topic, terms in topics.items():
+                if any(term in content for term in terms):
+                    row = result.setdefault(topic, {
+                        "actions_count": 0,
+                        "agents": set(),
+                        "rounds": set(),
+                        "platforms": Counter(),
+                    })
+                    row["actions_count"] += 1
+                    row["agents"].add(action.agent_id)
+                    row["rounds"].add(action.round_num)
+                    row["platforms"][action.platform] += 1
+        for row in result.values():
+            row["agents"] = sorted(row["agents"])
+            row["rounds"] = sorted(row["rounds"])
+            row["platforms"] = dict(row["platforms"])
+        return result
+
+    @classmethod
+    def _diagnostics_quality_report(
+        cls,
+        summary: Dict[str, Any],
+        agents: List[Dict[str, Any]],
+        off_track_agents: List[Dict[str, Any]],
+        topics: Dict[str, Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        actions_count = summary["actions_count"]
+        enough_signal = actions_count >= 3 and summary["useful_actions_count"] >= 2
+        off_track_ratio = len(off_track_agents) / len(agents) if agents else 0.0
+        recommendation = "none"
+        if not enough_signal:
+            recommendation = "run_more_rounds"
+        elif off_track_ratio > 0.35:
+            recommendation = "rerun_with_tighter_agent_or_topic_controls"
+        return {
+            "agents_stayed_on_topic": off_track_ratio <= 0.35,
+            "prediction_change_drivers": [
+                {"agent_id": agent["agent_id"], "agent_name": agent["agent_name"], "influence_score": agent["influence_score"]}
+                for agent in agents[:5]
+            ],
+            "enough_signal": enough_signal,
+            "recommended_next_run": recommendation,
+            "topic_coverage": {topic: row["actions_count"] for topic, row in topics.items()},
+        }
+
+    @staticmethod
+    def _action_content(action: AgentAction) -> str:
+        args = action.action_args or {}
+        parts = [
+            args.get("content"),
+            args.get("quote_content"),
+            args.get("original_content"),
+            args.get("post_content"),
+            args.get("query"),
+            action.result,
+        ]
+        return " ".join(str(part) for part in parts if part)
+
+    @staticmethod
+    def _is_generic_or_off_topic(content: str) -> bool:
+        lower = (content or "").lower()
+        return any(term in lower for term in {
+            "generic chatter",
+            "unrelated",
+            "hello",
+            "thanks for sharing",
+            "interesting point",
+            "not sure",
+        })
+
+    @staticmethod
+    def _is_contradictory(content: str) -> bool:
+        lower = (content or "").lower()
+        return any(term in lower for term in {"contradiction", "inconsistent", "conflicts with", "opposite"})
+
+    @staticmethod
+    def _infer_stance(content: str) -> str:
+        lower = (content or "").lower()
+        if any(term in lower for term in {"plaintiff", "moving party", "injunction should continue"}):
+            return "plaintiff_favorable"
+        if any(term in lower for term in {"defendant", "responding party", "motion should fail"}):
+            return "defendant_favorable"
+        return "neutral"
+
+    @staticmethod
+    def _infer_sentiment_drift(actions: List[AgentAction]) -> float:
+        positive_terms = {"strong", "succeed", "credible", "prove", "support"}
+        negative_terms = {"weak", "fail", "missing", "risk", "generic", "unrelated"}
+        scores = []
+        for action in sorted(actions, key=lambda item: item.timestamp):
+            content = SimulationRunner._action_content(action).lower()
+            scores.append(sum(term in content for term in positive_terms) - sum(term in content for term in negative_terms))
+        if len(scores) < 2:
+            return 0.0
+        return round((scores[-1] - scores[0]) / max(len(scores), 1), 4)
+
+    @staticmethod
+    def _evidence_relevance_score(content: str) -> float:
+        lower = (content or "").lower()
+        terms = ["evidence", "affidavit", "exhibit", "record", "proof", "document", "testimony"]
+        hits = sum(1 for term in terms if term in lower)
+        return round(min(1.0, hits / 3), 4)
     
     @classmethod
     def cleanup_simulation_logs(cls, simulation_id: str) -> Dict[str, Any]:
@@ -1783,4 +2071,3 @@ class SimulationRunner:
             results = results[:limit]
         
         return results
-

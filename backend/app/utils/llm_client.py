@@ -7,6 +7,7 @@ Supports Ollama num_ctx parameter to prevent prompt truncation
 import json
 import os
 import re
+import time
 from typing import Optional, Dict, Any, List
 from openai import OpenAI
 import requests
@@ -75,17 +76,12 @@ class LLMClient:
             body["temperature"] = temperature
 
         url = f"{self.base_url.rstrip('/')}/v1/messages"
-        response = requests.post(
-            url,
-            headers={
-                "x-api-key": self.api_key,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
-            json=body,
-            timeout=self.timeout,
-        )
-        response.raise_for_status()
+        headers = {
+            "x-api-key": self.api_key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        }
+        response = self._post_anthropic_with_retry(url, headers, body)
         data = response.json()
 
         text_parts = [
@@ -97,6 +93,44 @@ class LLMClient:
         if not content:
             raise ValueError("Anthropic-compatible LLM returned no text content")
         return content
+
+    def _post_anthropic_with_retry(
+        self,
+        url: str,
+        headers: Dict[str, str],
+        body: Dict[str, Any],
+    ) -> requests.Response:
+        max_retries = int(os.environ.get("LLM_HTTP_MAX_RETRIES", "4"))
+        base_delay = float(os.environ.get("LLM_HTTP_RETRY_BASE_SECONDS", "2"))
+        max_delay = float(os.environ.get("LLM_HTTP_RETRY_MAX_SECONDS", "30"))
+        last_error: Optional[Exception] = None
+
+        for attempt in range(max_retries + 1):
+            try:
+                response = requests.post(
+                    url,
+                    headers=headers,
+                    json=body,
+                    timeout=self.timeout,
+                )
+                response.raise_for_status()
+                return response
+            except (
+                requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout,
+                requests.exceptions.HTTPError,
+            ) as exc:
+                if isinstance(exc, requests.exceptions.HTTPError):
+                    status_code = exc.response.status_code if exc.response is not None else 0
+                    if status_code and status_code < 500 and status_code != 429:
+                        raise
+                last_error = exc
+                if attempt >= max_retries:
+                    raise
+                delay = min(max_delay, base_delay * (2 ** attempt))
+                time.sleep(delay)
+
+        raise last_error or RuntimeError("Anthropic-compatible LLM request failed")
 
     def chat(
         self,

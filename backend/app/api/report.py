@@ -10,7 +10,7 @@ from flask import request, jsonify, send_file, current_app
 
 from . import report_bp
 from ..config import Config
-from ..services.report_agent import ReportAgent, ReportManager, ReportStatus, normalize_report_mode
+from ..services.report_agent import ReportAgent, ReportManager, ReportStatus, normalize_report_mode, normalize_report_depth
 from ..services.forecasting import (
     infer_report_mode_from_forecast,
     load_simulation_config,
@@ -48,12 +48,19 @@ def generate_report():
         force_regenerate = data.get('force_regenerate', False)
         requested_report_mode = data.get('report_mode')
         report_mode = normalize_report_mode(requested_report_mode)
+        requested_report_depth = data.get('report_depth')
+        report_depth = normalize_report_depth(requested_report_depth)
         manager = SimulationManager()
         state = manager.get_simulation(simulation_id)
         if not state:
             return jsonify({"success": False, "error": f"Simulation does not exist: {simulation_id}"}), 404
 
         simulation_config = load_simulation_config(simulation_id)
+        if not requested_report_depth:
+            report_depth = normalize_report_depth(
+                simulation_config.get("report_depth")
+                or (simulation_config.get("prediction_settings") or {}).get("report_depth")
+            )
         if not requested_report_mode:
             forecast_settings = normalize_forecast_settings(
                 simulation_config,
@@ -68,6 +75,7 @@ def generate_report():
             if (
                 existing_report
                 and existing_report.report_mode == report_mode
+                and existing_report.report_depth == report_depth
                 and existing_report.status in [ReportStatus.COMPLETED, ReportStatus.NEEDS_REVIEW]
             ):
                 existing_issues = ReportManager.validate_report_output(existing_report)
@@ -82,6 +90,8 @@ def generate_report():
                     "simulation_id": simulation_id,
                     "report_id": existing_report.report_id,
                     "status": existing_report.status.value,
+                    "report_mode": existing_report.report_mode,
+                    "report_depth": existing_report.report_depth,
                     "message": "Report already exists",
                     "already_generated": True
                 }})
@@ -104,7 +114,13 @@ def generate_report():
         task_manager = TaskManager()
         task_id = task_manager.create_task(
             task_type="report_generate",
-            metadata={"simulation_id": simulation_id, "graph_id": graph_id, "report_id": report_id}
+            metadata={
+                "simulation_id": simulation_id,
+                "graph_id": graph_id,
+                "report_id": report_id,
+                "report_mode": report_mode,
+                "report_depth": report_depth,
+            }
         )
 
         # Initialize graph_tools in Flask context BEFORE spawning thread
@@ -139,6 +155,7 @@ def generate_report():
                     disable_interviews=_json_bool(data.get("disable_interviews"), False),
                     strict_antirepetition=_json_bool(data.get("strict_antirepetition"), False),
                     report_mode=report_mode,
+                    report_depth=report_depth,
                 )
                 def progress_callback(stage, progress, message):
                     task_manager.update_task(task_id, progress=progress, message=f"[{stage}] {message}")
@@ -150,6 +167,7 @@ def generate_report():
                         "simulation_id": simulation_id,
                         "status": report.status.value,
                         "forecast": report.forecast,
+                        "timing": report.timing,
                     })
                 else:
                     task_manager.fail_task(task_id, report.error or "Report generation failed")
@@ -165,6 +183,8 @@ def generate_report():
             "report_id": report_id,
             "task_id": task_id,
             "status": "generating",
+            "report_mode": report_mode,
+            "report_depth": report_depth,
             "message": "Report generation task started. Query progress via /api/report/generate/status",
             "already_generated": False
         }})
@@ -413,6 +433,79 @@ def regenerate_report_section(report_id: str, section_index: int):
         return jsonify({"success": False, "error": str(e), "traceback": traceback.format_exc()}), 500
 
 
+@report_bp.route('/<report_id>/resume', methods=['POST'])
+def resume_report(report_id: str):
+    try:
+        data = request.get_json() or {}
+        report = ReportManager.get_report(report_id)
+        if not report:
+            return jsonify({"success": False, "error": f"Report does not exist: {report_id}"}), 404
+        progress = ReportManager.get_progress(report_id) or {}
+        resumable_statuses = [
+            ReportStatus.FAILED,
+            ReportStatus.GENERATING,
+            ReportStatus.PENDING,
+            ReportStatus.INTERRUPTED,
+            ReportStatus.STALE,
+        ]
+        if report.status not in resumable_statuses and not progress.get("is_stale"):
+            return jsonify({"success": False, "error": f"Report cannot be resumed from status: {report.status.value}"}), 409
+
+        storage = current_app.extensions.get('neo4j_storage')
+        if not storage:
+            raise ValueError("GraphStorage not initialized - check Neo4j connection")
+
+        task_manager = TaskManager()
+        task_id = task_manager.create_task(
+            task_type="report_resume",
+            metadata={"simulation_id": report.simulation_id, "graph_id": report.graph_id, "report_id": report_id}
+        )
+
+        def run_resume():
+            try:
+                task_manager.update_task(task_id, status=TaskStatus.PROCESSING, progress=0, message="Resuming report...")
+                agent = ReportAgent(
+                    graph_id=report.graph_id,
+                    simulation_id=report.simulation_id,
+                    simulation_requirement=report.simulation_requirement,
+                    graph_tools=GraphToolsService(storage=storage),
+                    disable_interviews=_json_bool(data.get("disable_interviews"), False),
+                    strict_antirepetition=_json_bool(data.get("strict_antirepetition"), True),
+                    report_mode=report.report_mode,
+                )
+
+                def progress_callback(stage, progress, message):
+                    task_manager.update_task(task_id, progress=progress, message=f"[{stage}] {message}")
+
+                resumed = agent.resume_report(report, progress_callback=progress_callback)
+                if resumed.status in [ReportStatus.COMPLETED, ReportStatus.NEEDS_REVIEW]:
+                    task_manager.complete_task(task_id, result={
+                        "report_id": resumed.report_id,
+                        "simulation_id": resumed.simulation_id,
+                        "status": resumed.status.value,
+                        "forecast": resumed.forecast,
+                    })
+                else:
+                    task_manager.fail_task(task_id, resumed.error or "Report resume failed")
+            except Exception as e:
+                logger.error(f"Report resume failed: {str(e)}")
+                task_manager.fail_task(task_id, str(e))
+
+        thread = threading.Thread(target=run_resume, daemon=True)
+        thread.start()
+
+        return jsonify({"success": True, "data": {
+            "simulation_id": report.simulation_id,
+            "report_id": report_id,
+            "task_id": task_id,
+            "status": "generating",
+            "message": "Report resume task started"
+        }})
+    except Exception as e:
+        logger.error(f"Failed to resume report: {str(e)}")
+        return jsonify({"success": False, "error": str(e), "traceback": traceback.format_exc()}), 500
+
+
 # ============== Report Status Check Interface ==============
 
 @report_bp.route('/check/<simulation_id>', methods=['GET'])
@@ -423,12 +516,14 @@ def check_report_status(simulation_id: str):
         report_status = report.status.value if report and hasattr(report.status, 'value') else (report.status if report else None)
         report_id = report.report_id if report else None
         interview_unlocked = has_report and report.status in [ReportStatus.COMPLETED, ReportStatus.NEEDS_REVIEW]
+        progress = ReportManager.get_progress(report_id) if report_id else None
         return jsonify({"success": True, "data": {
             "simulation_id": simulation_id,
             "has_report": has_report,
             "report_id": report_id,
             "report_status": report_status,
-            "interview_unlocked": interview_unlocked
+            "interview_unlocked": interview_unlocked,
+            "progress": progress
         }})
     except Exception as e:
         logger.error(f"Failed to check report status: {str(e)}")

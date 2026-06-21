@@ -4,6 +4,7 @@ Step2: Entity reading and filtering, OASIS simulation preparation and execution 
 """
 
 import os
+import json
 import traceback
 from flask import request, jsonify, send_file, current_app
 
@@ -13,7 +14,9 @@ from ..services.entity_reader import EntityReader
 from ..services.oasis_profile_generator import OasisProfileGenerator
 from ..services.simulation_manager import SimulationManager, SimulationStatus
 from ..services.simulation_runner import SimulationRunner, RunnerStatus
+from ..services.report_agent import ReportManager
 from ..services.forecasting import normalize_forecast_settings
+from ..models.case import normalize_prediction_settings
 from ..utils.logger import get_logger
 from ..models.project import ProjectManager
 
@@ -207,11 +210,19 @@ def create_simulation():
             }), 400
         
         manager = SimulationManager()
+        prediction_settings = normalize_prediction_settings(
+            {
+                **(project.prediction_settings or {}),
+                **(data.get("prediction_settings") or {}),
+                **data,
+            }
+        )
         state = manager.create_simulation(
             project_id=project_id,
             graph_id=graph_id,
             enable_twitter=data.get('enable_twitter', True),
             enable_reddit=data.get('enable_reddit', True),
+            prediction_settings=prediction_settings,
         )
         
         return jsonify({
@@ -455,9 +466,20 @@ def prepare_simulation():
         # Get document text
         document_text = ProjectManager.get_extracted_text(state.project_id) or ""
         
-        entity_types_list = data.get('entity_types')
+        state_prediction_settings = normalize_prediction_settings(
+            {
+                **(getattr(state, "prediction_settings", {}) or {}),
+                **(project.prediction_settings or {}),
+                **(data.get("prediction_settings") or {}),
+                **data,
+            }
+        )
+        entity_types_list = data.get('entity_types') or state_prediction_settings.get("entity_types_include")
         use_llm_for_profiles = data.get('use_llm_for_profiles', True)
-        parallel_profile_count = data.get('parallel_profile_count', 5)
+        parallel_profile_count = data.get(
+            'parallel_profile_count',
+            state_prediction_settings.get("profile_parallelism", 5),
+        )
         raw_forecast_settings = {
             "forecast_mode": data.get("forecast_mode"),
             "forecast_horizon": data.get("forecast_horizon"),
@@ -507,6 +529,9 @@ def prepare_simulation():
         state.scenario_pack = forecast_settings.scenario_pack
         state.ensemble_runs = forecast_settings.ensemble_runs
         state.memory_mode = forecast_settings.memory_mode
+        state.prediction_settings = state_prediction_settings
+        state.report_mode = state_prediction_settings.get("report_mode", state.report_mode)
+        state.report_depth = state_prediction_settings.get("report_depth", state.report_depth)
         
         # Create async task
         task_manager = TaskManager()
@@ -578,7 +603,8 @@ def prepare_simulation():
                         "stage_progress": progress,
                         "current_item": detail["current"],
                         "total_items": detail["total"],
-                        "item_description": message
+                        "item_description": message,
+                        "timing": kwargs.get("timing"),
                     }
                     
                     # Build concise message
@@ -607,6 +633,7 @@ def prepare_simulation():
                     parallel_profile_count=parallel_profile_count,
                     storage=storage,
                     forecast_settings=forecast_settings,
+                    prediction_settings=state_prediction_settings,
                 )
                 
                 # Task complete
@@ -641,6 +668,7 @@ def prepare_simulation():
                 "expected_entities_count": state.entities_count,  # Expected number of entities to process
                 "entity_types": state.entity_types,  # Entity type list
                 "forecast_settings": forecast_settings.to_dict(),
+                "prediction_settings": state_prediction_settings,
             }
         })
         
@@ -977,8 +1005,20 @@ def get_simulation_history():
             else:
                 sim_dict["files"] = []
             
-            # Get associated report_id（FindThis simulation Latest report）
-            sim_dict["report_id"] = _get_report_id_for_simulation(sim.simulation_id)
+            # Get associated report metadata（FindThis simulation Latest report）
+            latest_report_id = _get_report_id_for_simulation(sim.simulation_id)
+            sim_dict["report_id"] = latest_report_id
+            sim_dict["report_status"] = None
+            sim_dict["report_progress"] = None
+            if latest_report_id:
+                try:
+                    report = ReportManager.get_report(latest_report_id)
+                    if report:
+                        sim_dict["report_status"] = report.status.value
+                        sim_dict["report_progress"] = ReportManager.get_progress(latest_report_id)
+                except Exception:
+                    sim_dict["report_status"] = None
+                    sim_dict["report_progress"] = None
             
             # Add version number
             sim_dict["version"] = "v1.0.2"
@@ -1561,6 +1601,26 @@ def start_simulation():
                 "error": f"Simulation does not exist: {simulation_id}"
             }), 404
 
+        prediction_settings = normalize_prediction_settings(
+            {
+                **(getattr(state, "prediction_settings", {}) or {}),
+                **(data.get("prediction_settings") or {}),
+                **data,
+            }
+        )
+        if max_rounds is None:
+            max_rounds = prediction_settings.get("max_rounds")
+        if scenario_id is None:
+            scenario_pack = prediction_settings.get("scenario_pack") or ""
+            scenario_id = str(scenario_pack).split(",")[0].strip() or None
+        if memory_mode is None:
+            memory_mode = prediction_settings.get("memory_mode")
+        if seed is None:
+            seed = prediction_settings.get("seed")
+        state.prediction_settings = prediction_settings
+        state.memory_mode = memory_mode or state.memory_mode
+        manager._save_simulation_state(state)
+
         force_restarted = False
         
         # Intelligently handle status: if preparation work is complete, reset status to ready
@@ -1663,6 +1723,7 @@ def start_simulation():
             response_data['seed'] = seed
         if memory_mode:
             response_data['memory_mode'] = memory_mode
+        response_data['prediction_settings'] = prediction_settings
         
         return jsonify({
             "success": True,
@@ -2023,6 +2084,76 @@ def get_agent_stats(simulation_id: str):
             "error": str(e),
             "traceback": traceback.format_exc()
         }), 500
+
+
+@simulation_bp.route('/<simulation_id>/diagnostics', methods=['GET'])
+def get_run_diagnostics(simulation_id: str):
+    """Get summarized agent diagnostics for a simulation run."""
+    try:
+        diagnostics = SimulationRunner.get_run_diagnostics(simulation_id)
+        return jsonify({"success": True, "data": diagnostics})
+    except Exception as e:
+        logger.error(f"Failed to get run diagnostics: {str(e)}")
+        return jsonify({"success": False, "error": str(e), "traceback": traceback.format_exc()}), 500
+
+
+@simulation_bp.route('/<simulation_id>/diagnostics/agents', methods=['GET'])
+def get_agent_diagnostics(simulation_id: str):
+    """Get per-agent diagnostics with optional filters."""
+    try:
+        diagnostics = SimulationRunner.get_run_diagnostics(simulation_id)
+        agents = diagnostics.get("agents", [])
+        if request.args.get("high_impact", "false").lower() == "true":
+            agents = diagnostics.get("high_impact_agents", [])
+        if request.args.get("off_track", "false").lower() == "true":
+            agents = diagnostics.get("off_track_agents", [])
+        return jsonify({"success": True, "data": {"agents": agents, "count": len(agents)}})
+    except Exception as e:
+        logger.error(f"Failed to get agent diagnostics: {str(e)}")
+        return jsonify({"success": False, "error": str(e), "traceback": traceback.format_exc()}), 500
+
+
+@simulation_bp.route('/<simulation_id>/diagnostics/topics', methods=['GET'])
+def get_topic_diagnostics(simulation_id: str):
+    """Get topic/issue diagnostics."""
+    try:
+        diagnostics = SimulationRunner.get_run_diagnostics(simulation_id)
+        return jsonify({"success": True, "data": diagnostics.get("topics", {})})
+    except Exception as e:
+        logger.error(f"Failed to get topic diagnostics: {str(e)}")
+        return jsonify({"success": False, "error": str(e), "traceback": traceback.format_exc()}), 500
+
+
+@simulation_bp.route('/<simulation_id>/diagnostics/off-track', methods=['GET'])
+def get_off_track_agents(simulation_id: str):
+    """Get off-track agents only."""
+    try:
+        diagnostics = SimulationRunner.get_run_diagnostics(simulation_id)
+        return jsonify({
+            "success": True,
+            "data": {
+                "agents": diagnostics.get("off_track_agents", []),
+                "count": len(diagnostics.get("off_track_agents", [])),
+            },
+        })
+    except Exception as e:
+        logger.error(f"Failed to get off-track agents: {str(e)}")
+        return jsonify({"success": False, "error": str(e), "traceback": traceback.format_exc()}), 500
+
+
+@simulation_bp.route('/<simulation_id>/diagnostics/export', methods=['GET'])
+def export_run_diagnostics(simulation_id: str):
+    """Export diagnostics as JSON."""
+    try:
+        import tempfile
+        diagnostics = SimulationRunner.get_run_diagnostics(simulation_id)
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False, encoding='utf-8') as f:
+            json.dump(diagnostics, f, ensure_ascii=False, indent=2)
+            path = f.name
+        return send_file(path, as_attachment=True, download_name=f"{simulation_id}-diagnostics.json")
+    except Exception as e:
+        logger.error(f"Failed to export diagnostics: {str(e)}")
+        return jsonify({"success": False, "error": str(e), "traceback": traceback.format_exc()}), 500
 
 
 # ============== Database query interface ==============

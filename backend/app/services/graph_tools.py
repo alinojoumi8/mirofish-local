@@ -820,7 +820,8 @@ class GraphToolsService:
         query: str,
         simulation_requirement: str,
         report_context: str = "",
-        max_sub_queries: int = 5
+        max_sub_queries: int = 5,
+        use_llm_decomposition: bool = True,
     ) -> InsightForgeResult:
         """
         [InsightForge - Deep Insight Retrieval]
@@ -840,13 +841,17 @@ class GraphToolsService:
             sub_queries=[]
         )
 
-        # Step 1: Use LLM to generate sub-questions
-        sub_queries = self._generate_sub_queries(
-            query=query,
-            simulation_requirement=simulation_requirement,
-            report_context=report_context,
-            max_queries=max_sub_queries
-        )
+        # Step 1: Optionally use LLM to generate sub-questions. Fast/default
+        # retrieval keeps the query pipeline on Neo4j vector + fulltext search.
+        if use_llm_decomposition and max_sub_queries > 1:
+            sub_queries = self._generate_sub_queries(
+                query=query,
+                simulation_requirement=simulation_requirement,
+                report_context=report_context,
+                max_queries=max_sub_queries
+            )
+        else:
+            sub_queries = [query]
         result.sub_queries = sub_queries
         logger.info(f"Generated {len(sub_queries)} sub-questions")
 
@@ -870,17 +875,19 @@ class GraphToolsService:
 
             all_edges.extend(search_result.edges)
 
-        # Also search for the original question
-        main_search = self.search_graph(
-            graph_id=graph_id,
-            query=query,
-            limit=20,
-            scope="edges"
-        )
-        for fact in main_search.facts:
-            if fact not in seen_facts:
-                all_facts.append(fact)
-                seen_facts.add(fact)
+        # Also search for the original question when LLM expansion added
+        # distinct sub-queries. The no-LLM path already searched it once.
+        if any(sub_query != query for sub_query in sub_queries):
+            main_search = self.search_graph(
+                graph_id=graph_id,
+                query=query,
+                limit=20,
+                scope="edges"
+            )
+            for fact in main_search.facts:
+                if fact not in seen_facts:
+                    all_facts.append(fact)
+                    seen_facts.add(fact)
 
         result.semantic_facts = all_facts
         result.total_facts = len(all_facts)
@@ -1125,6 +1132,18 @@ Return the sub-questions as a JSON list."""
 
         result.total_agents = len(profiles)
         logger.info(f"Loaded {len(profiles)} Agent profiles")
+
+        if not SimulationRunner.check_env_alive(simulation_id):
+            logger.info(
+                "Live simulation environment is not running for %s; skipping interview tool",
+                simulation_id,
+            )
+            result.summary = (
+                "Live agent interviews were skipped because the simulation environment is not running. "
+                "Use graph evidence and saved simulation actions for this section, or resume the report while "
+                "the simulation environment is still active to collect new interviews."
+            )
+            return result
 
         # Step 2: Use LLM to select Agents for interview
         selected_agents, selected_indices, selection_reasoning = self._select_agents_for_interview(

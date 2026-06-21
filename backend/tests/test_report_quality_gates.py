@@ -1,6 +1,8 @@
 from datetime import datetime, timedelta
 
 from app.services.report_agent import Report, ReportManager, ReportSection, ReportStatus, normalize_report_mode
+from app.services.report_agent import ReportAgent, ReportOutline
+from app.config import Config
 
 
 def test_validate_report_output_blocks_raw_tool_call():
@@ -153,3 +155,88 @@ def test_report_section_serializes_evidence_cards():
     )
 
     assert section.to_dict()["evidence_cards"][0]["fact"] == "Duolingo expected 88% migration."
+
+
+class ResumeAgent(ReportAgent):
+    def __init__(self):
+        self.graph_id = "graph_1"
+        self.simulation_id = "sim_1"
+        self.simulation_requirement = "test"
+        self.report_mode = "prediction"
+        self.report_logger = None
+        self.console_logger = None
+        self.disable_interviews = False
+        self.strict_antirepetition = False
+        self.tools = []
+        self.generated = []
+
+    def _generate_section_react(self, section, outline, previous_sections, progress_callback=None, section_index=1):
+        self.generated.append(section_index)
+        return f"generated section {section_index}"
+
+    def _apply_forecast_synthesis(self, report, outline):
+        report.forecast = {"confidence": "test"}
+
+
+def test_resume_report_continues_from_first_missing_section(tmp_path, monkeypatch):
+    monkeypatch.setattr(Config, "UPLOAD_FOLDER", str(tmp_path))
+    monkeypatch.setattr(ReportManager, "REPORTS_DIR", str(tmp_path / "reports"))
+    agent = ResumeAgent()
+    report = Report(
+        report_id="report_resume",
+        simulation_id="sim_1",
+        graph_id="graph_1",
+        simulation_requirement="test",
+        status=ReportStatus.FAILED,
+        outline=ReportOutline(
+            title="Report",
+            summary="Summary",
+            sections=[
+                ReportSection(title="One"),
+                ReportSection(title="Two"),
+                ReportSection(title="Three"),
+            ],
+        ),
+        error="temporary DNS failure",
+    )
+    ReportManager.save_report(report)
+    report.outline.sections[0].content = "already generated"
+    ReportManager.save_section(report.report_id, 1, report.outline.sections[0])
+    ReportManager.update_progress(
+        report.report_id,
+        "failed",
+        -1,
+        "failed on section 2",
+        completed_sections=["One"],
+        current_section="Two",
+        failed_section_index=2,
+        failed_section_title="Two",
+    )
+
+    resumed = agent.resume_report(report)
+
+    assert agent.generated == [2, 3]
+    assert resumed.status in {ReportStatus.COMPLETED, ReportStatus.NEEDS_REVIEW}
+    sections = ReportManager.get_generated_sections(report.report_id)
+    assert [section["section_index"] for section in sections] == [1, 2, 3]
+
+
+def test_report_progress_records_failed_section_metadata(tmp_path, monkeypatch):
+    monkeypatch.setattr(Config, "UPLOAD_FOLDER", str(tmp_path))
+    monkeypatch.setattr(ReportManager, "REPORTS_DIR", str(tmp_path / "reports"))
+
+    ReportManager.update_progress(
+        "report_failed",
+        "failed",
+        -1,
+        "section failed",
+        current_section="Risk",
+        completed_sections=["Intro"],
+        failed_section_index=2,
+        failed_section_title="Risk",
+    )
+
+    progress = ReportManager.get_progress("report_failed")
+
+    assert progress["failed_section_index"] == 2
+    assert progress["failed_section_title"] == "Risk"

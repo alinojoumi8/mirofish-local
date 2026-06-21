@@ -138,6 +138,10 @@
               <span class="metric-label">Elapsed</span>
               <span class="metric-value mono">{{ formatElapsedTime }}</span>
             </div>
+            <div class="metric" v-if="activeReportTimingPhase">
+              <span class="metric-label">Phase</span>
+              <span class="metric-value mono">{{ activeReportTimingPhase }}</span>
+            </div>
             <div class="metric">
               <span class="metric-label">Tools</span>
               <span class="metric-value mono">{{ totalToolCalls }}</span>
@@ -164,6 +168,12 @@
 
           <div class="operator-actions">
             <span class="operator-mode mono">Mode {{ reportModeLabel }}</span>
+            <button v-if="canResumeReport" class="operator-btn operator-btn-primary" :disabled="isResuming" @click="resumeFailedReport({})">
+              {{ isResuming ? 'Resuming...' : 'Resume failed section' }}
+            </button>
+            <button v-if="canResumeReport" class="operator-btn" :disabled="isResuming" @click="resumeFailedReport({ disable_interviews: true })">
+              Resume no interviews
+            </button>
             <button class="operator-btn" :disabled="!reportGraphId || isRepairing" @click="repairEmbeddings">
               {{ isRepairing ? 'Repairing...' : 'Repair embeddings' }}
             </button>
@@ -489,7 +499,7 @@
 <script setup>
 import { ref, computed, watch, onMounted, onUnmounted, nextTick, h, reactive } from 'vue'
 import { useRouter } from 'vue-router'
-import { generateReport, getAgentLog, getConsoleLog, getReport, getReportProgress, regenerateReportSection } from '../api/report'
+import { generateReport, getAgentLog, getConsoleLog, getReport, getReportProgress, regenerateReportSection, resumeReport } from '../api/report'
 import { benchmarkGraphEmbeddings, getGraphQuality, reembedGraph } from '../api/graph'
 
 const router = useRouter()
@@ -524,6 +534,7 @@ const isComplete = ref(false)
 const reportStatus = ref('pending')
 const reportQuality = ref(null)
 const reportProgress = ref(null)
+const reportTiming = ref(null)
 const graphQuality = ref(null)
 const forecastData = ref(null)
 const reportSimulationId = ref(props.simulationId || null)
@@ -531,6 +542,7 @@ const reportGraphId = ref(null)
 const reportMode = ref('prediction')
 const isRepairing = ref(false)
 const isRegenerating = ref(false)
+const isResuming = ref(false)
 const regeneratingSection = ref(null)
 const isBenchmarking = ref(false)
 const benchmarkResult = ref(null)
@@ -1831,6 +1843,10 @@ const statusText = computed(() => {
   return 'Waiting'
 })
 
+const canResumeReport = computed(() => {
+  return !!props.reportId && (reportStatus.value === 'failed' || reportProgress.value?.is_stale)
+})
+
 const graphQualityStatusClass = computed(() => {
   if (!graphQuality.value) return 'pending'
   if (graphQuality.value.status === 'fail') return 'error'
@@ -1914,7 +1930,26 @@ const totalToolCalls = computed(() => {
   return agentLogs.value.filter(l => l.action === 'tool_call').length
 })
 
+const formatDuration = (seconds) => {
+  if (seconds === null || seconds === undefined || Number.isNaN(Number(seconds))) return null
+  const totalSeconds = Math.max(0, Math.round(Number(seconds)))
+  const minutes = Math.floor(totalSeconds / 60)
+  const remainingSeconds = totalSeconds % 60
+  const hours = Math.floor(minutes / 60)
+  const remainingMinutes = minutes % 60
+  if (hours > 0) return `${hours}h ${remainingMinutes}m`
+  if (minutes > 0) return `${minutes}m ${remainingSeconds}s`
+  return `${remainingSeconds}s`
+}
+
+const activeReportTimingPhase = computed(() => {
+  const active = reportTiming.value?.active_phases?.[0]
+  return active?.label || active?.name || ''
+})
+
 const formatElapsedTime = computed(() => {
+  const persistedDuration = formatDuration(reportTiming.value?.total_seconds)
+  if (persistedDuration) return persistedDuration
   if (!startTime.value) return '0s'
   const lastLog = agentLogs.value[agentLogs.value.length - 1]
   const elapsed = lastLog?.elapsed_seconds || 0
@@ -2048,6 +2083,24 @@ const regenerateReport = async (options = {}) => {
     addLog(`Regeneration failed: ${err.message}`)
   } finally {
     isRegenerating.value = false
+  }
+}
+
+const resumeFailedReport = async (options = {}) => {
+  if (!props.reportId || isResuming.value) return
+  isResuming.value = true
+  try {
+    addLog(`Resuming report from failed section: ${JSON.stringify(options)}`)
+    const res = await resumeReport(props.reportId, options)
+    if (res.success) {
+      reportStatus.value = 'generating'
+      emit('update-status', 'generating')
+      await refreshReportState()
+    }
+  } catch (err) {
+    addLog(`Report resume failed: ${err.message}`)
+  } finally {
+    isResuming.value = false
   }
 }
 
@@ -2369,6 +2422,7 @@ const fetchReportSnapshot = async () => {
       const report = reportRes.value.data
       reportStatus.value = report.status || reportStatus.value
       reportQuality.value = report.quality_score || null
+      reportTiming.value = report.timing || reportTiming.value
       forecastData.value = report.forecast || null
       reportSimulationId.value = report.simulation_id || reportSimulationId.value
       reportGraphId.value = report.graph_id || reportGraphId.value
@@ -2409,6 +2463,9 @@ const fetchReportSnapshot = async () => {
 
     if (progressRes.status === 'fulfilled' && progressRes.value?.success && progressRes.value.data) {
       reportProgress.value = progressRes.value.data
+      if (reportProgress.value.timing) {
+        reportTiming.value = reportProgress.value.timing
+      }
       if (reportProgress.value.effective_status) {
         reportStatus.value = reportProgress.value.effective_status
       }
@@ -3338,6 +3395,17 @@ watch(() => props.reportId, (newId) => {
 .operator-btn:hover:not(:disabled) {
   background: #F9FAFB;
   border-color: #9CA3AF;
+}
+
+.operator-btn-primary {
+  background: #111827;
+  border-color: #111827;
+  color: #FFFFFF;
+}
+
+.operator-btn-primary:hover:not(:disabled) {
+  background: #1F2937;
+  border-color: #1F2937;
 }
 
 .operator-btn:disabled {

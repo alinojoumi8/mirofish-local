@@ -7,8 +7,13 @@ dimensions so it remains compatible with the existing Neo4j vector indexes.
 """
 
 import logging
+import hashlib
+import json
+import os
 import time
+import threading
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -39,6 +44,69 @@ class EmbeddingProviderInfo:
         return data
 
 
+class EmbeddingCache:
+    """Disk-backed embedding cache keyed by provider, task type, and text."""
+
+    VERSION = "embedding-v1"
+
+    def __init__(self, cache_dir: Optional[str | os.PathLike[str]] = None):
+        self.cache_dir = Path(cache_dir or Config.GRAPH_EMBEDDING_CACHE_DIR)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _hash_text(text: str) -> str:
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+    def get(self, provider_id: str, task_type: str, text: str) -> Optional[List[float]]:
+        path = self._path(provider_id, task_type, text)
+        if not path.exists():
+            return None
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            return None
+
+        metadata = payload.get("metadata", {})
+        if (
+            metadata.get("version") != self.VERSION
+            or metadata.get("provider_id") != provider_id
+            or metadata.get("task_type") != task_type
+            or metadata.get("text_hash") != self._hash_text(text)
+        ):
+            return None
+        vector = payload.get("vector")
+        return vector if isinstance(vector, list) else None
+
+    def set(self, provider_id: str, task_type: str, text: str, vector: List[float]) -> None:
+        path = self._path(provider_id, task_type, text)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "metadata": {
+                "version": self.VERSION,
+                "provider_id": provider_id,
+                "task_type": task_type,
+                "text_hash": self._hash_text(text),
+            },
+            "vector": vector,
+        }
+        tmp_path = path.with_suffix(".tmp")
+        with self._lock:
+            with tmp_path.open("w", encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=False)
+            os.replace(tmp_path, path)
+
+    def _path(self, provider_id: str, task_type: str, text: str) -> Path:
+        cache_key = self._hash_text("|".join([
+            self.VERSION,
+            provider_id,
+            task_type,
+            self._hash_text(text),
+        ]))
+        return self.cache_dir / cache_key[:2] / f"{cache_key}.json"
+
+
 class EmbeddingService:
     """Generate embeddings using Ollama or Gemini."""
 
@@ -60,6 +128,9 @@ class EmbeddingService:
         self.auto_pull = Config.EMBEDDING_AUTO_PULL if auto_pull is None else auto_pull
         self._cache: dict[tuple[str, str], List[float]] = {}
         self._cache_max_size = 2000
+        self._persistent_cache = (
+            EmbeddingCache() if Config.GRAPH_EMBEDDING_CACHE_ENABLED else None
+        )
         self._ready_checked = False
         self._unavailable_until = 0.0
         self._last_error: Optional[str] = None
@@ -131,6 +202,14 @@ class EmbeddingService:
             cache_key = (task_type, text)
             if cache_key in self._cache:
                 results[i] = self._cache[cache_key]
+            elif text and self._persistent_cache:
+                cached = self._persistent_cache.get(self.provider_id(), task_type, text)
+                if cached is not None:
+                    results[i] = cached
+                    self._cache_put(cache_key, cached)
+                else:
+                    uncached_indices.append(i)
+                    uncached_texts.append(text)
             elif text:
                 uncached_indices.append(i)
                 uncached_texts.append(text)
@@ -146,6 +225,8 @@ class EmbeddingService:
             for idx, vec, text in zip(uncached_indices, all_vectors, uncached_texts):
                 results[idx] = vec
                 self._cache_put((task_type, text), vec)
+                if self._persistent_cache:
+                    self._persistent_cache.set(self.provider_id(), task_type, text, vec)
 
         return results  # type: ignore
 

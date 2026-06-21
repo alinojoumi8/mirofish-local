@@ -120,3 +120,41 @@ export function getProject(projectId) {
     method: 'get'
   })
 }
+
+export function createCase(data) {
+  return service({
+    url: '/api/graph/case/create',
+    method: 'post',
+    data
+  })
+}
+
+export function listCases(limit = 50) {
+  return service({
+    url: '/api/graph/case/list',
+    method: 'get',
+    params: { limit }
+  })
+}
+
+export function getCase(caseId) {
+  return service({
+    url: `/api/graph/case/${caseId}`,
+    method: 'get'
+  })
+}
+
+export function listCaseVersions(caseId) {
+  return service({
+    url: `/api/graph/case/${caseId}/versions`,
+    method: 'get'
+  })
+}
+
+export function compareCaseVersions(caseId, data) {
+  return service({
+    url: `/api/graph/case/${caseId}/compare`,
+    method: 'post',
+    data
+  })
+}

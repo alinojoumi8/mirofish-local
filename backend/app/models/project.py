@@ -34,6 +34,7 @@ class Project:
 
     # File information
     files: List[Dict[str, str]] = field(default_factory=list)  # [{filename, path, size}]
+    documents: List[Dict[str, Any]] = field(default_factory=list)
     total_text_length: int = 0
 
     # Ontology information (populated after interface 1 generates)
@@ -43,11 +44,19 @@ class Project:
     # Graph information (populated after interface 2 completes)
     graph_id: Optional[str] = None
     graph_build_task_id: Optional[str] = None
+    graph_build_settings: Dict[str, Any] = field(default_factory=dict)
 
     # Configuration
     simulation_requirement: Optional[str] = None
     chunk_size: int = Config.DEFAULT_CHUNK_SIZE
     chunk_overlap: int = Config.DEFAULT_CHUNK_OVERLAP
+    prediction_settings: Dict[str, Any] = field(default_factory=dict)
+    timings: Dict[str, Any] = field(default_factory=dict)
+
+    # Case-level litigation workflow metadata
+    case_id: Optional[str] = None
+    case_version_id: Optional[str] = None
+    case_version_number: Optional[int] = None
 
     # Error information
     error: Optional[str] = None
@@ -61,14 +70,21 @@ class Project:
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "files": self.files,
+            "documents": self.documents,
             "total_text_length": self.total_text_length,
             "ontology": self.ontology,
             "analysis_summary": self.analysis_summary,
             "graph_id": self.graph_id,
             "graph_build_task_id": self.graph_build_task_id,
+            "graph_build_settings": self.graph_build_settings,
             "simulation_requirement": self.simulation_requirement,
             "chunk_size": self.chunk_size,
             "chunk_overlap": self.chunk_overlap,
+            "prediction_settings": self.prediction_settings,
+            "timings": self.timings,
+            "case_id": self.case_id,
+            "case_version_id": self.case_version_id,
+            "case_version_number": self.case_version_number,
             "error": self.error
         }
     
@@ -86,14 +102,21 @@ class Project:
             created_at=data.get('created_at', ''),
             updated_at=data.get('updated_at', ''),
             files=data.get('files', []),
+            documents=data.get('documents', []),
             total_text_length=data.get('total_text_length', 0),
             ontology=data.get('ontology'),
             analysis_summary=data.get('analysis_summary'),
             graph_id=data.get('graph_id'),
             graph_build_task_id=data.get('graph_build_task_id'),
+            graph_build_settings=data.get('graph_build_settings', {}),
             simulation_requirement=data.get('simulation_requirement'),
             chunk_size=data.get('chunk_size', Config.DEFAULT_CHUNK_SIZE),
             chunk_overlap=data.get('chunk_overlap', Config.DEFAULT_CHUNK_OVERLAP),
+            prediction_settings=data.get('prediction_settings', {}),
+            timings=data.get('timings', {}),
+            case_id=data.get('case_id'),
+            case_version_id=data.get('case_version_id'),
+            case_version_number=data.get('case_version_number'),
             error=data.get('error')
         )
 
@@ -128,6 +151,11 @@ class ProjectManager:
     def _get_project_text_path(cls, project_id: str) -> str:
         """Get project extracted text storage path"""
         return os.path.join(cls._get_project_dir(project_id), 'extracted_text.txt')
+
+    @classmethod
+    def _get_project_documents_path(cls, project_id: str) -> str:
+        """Get per-document extracted text storage path."""
+        return os.path.join(cls._get_project_dir(project_id), 'documents.json')
 
     @classmethod
     def create_project(cls, name: str = "Unnamed Project") -> Project:
@@ -279,6 +307,23 @@ class ProjectManager:
             f.write(text)
 
     @classmethod
+    def save_document_texts(cls, project_id: str, documents: List[Dict[str, Any]]) -> None:
+        """Save per-document extracted text and provenance metadata."""
+        docs_path = cls._get_project_documents_path(project_id)
+        with open(docs_path, 'w', encoding='utf-8') as f:
+            json.dump(documents, f, ensure_ascii=False, indent=2)
+
+    @classmethod
+    def get_document_texts(cls, project_id: str) -> List[Dict[str, Any]]:
+        """Get per-document extracted text and metadata."""
+        docs_path = cls._get_project_documents_path(project_id)
+        if not os.path.exists(docs_path):
+            return []
+        with open(docs_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+
+    @classmethod
     def get_extracted_text(cls, project_id: str) -> Optional[str]:
         """Get extracted text"""
         text_path = cls._get_project_text_path(project_id)
@@ -302,4 +347,3 @@ class ProjectManager:
             for f in os.listdir(files_dir)
             if os.path.isfile(os.path.join(files_dir, f))
         ]
-
