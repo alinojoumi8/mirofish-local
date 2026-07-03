@@ -290,14 +290,28 @@ class SimulationIPCClient:
                 run_state = json.load(f)
             process_pid = run_state.get("process_pid")
             if not process_pid:
+                logger.warning(
+                    "IPC environment marked alive but run_state has no process_pid: simulation_dir=%s",
+                    self.simulation_dir,
+                )
                 return False
 
             try:
                 os.kill(int(process_pid), 0)
                 return True
             except (OSError, ValueError, TypeError):
+                logger.warning(
+                    "IPC environment marked alive but process is not running: simulation_dir=%s pid=%s",
+                    self.simulation_dir,
+                    process_pid,
+                )
                 return False
-        except (json.JSONDecodeError, OSError):
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.warning(
+                "Failed to read IPC environment liveness status: simulation_dir=%s error=%s",
+                self.simulation_dir,
+                exc,
+            )
             return False
 
 

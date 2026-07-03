@@ -13,6 +13,10 @@ from openai import OpenAI
 import requests
 
 from ..config import Config
+from ..utils.logger import get_logger
+
+
+logger = get_logger('mirofish.llm_client')
 
 
 class LLMClient:
@@ -127,6 +131,12 @@ class LLMClient:
                 last_error = exc
                 if attempt >= max_retries:
                     raise
+                logger.warning(
+                    "Anthropic-compatible LLM request failed (attempt %s/%s): %s",
+                    attempt + 1,
+                    max_retries + 1,
+                    exc,
+                )
                 delay = min(max_delay, base_delay * (2 ** attempt))
                 time.sleep(delay)
 

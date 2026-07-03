@@ -18,11 +18,27 @@
                 <span class="forecast-summary-title">Forecast probabilities</span>
                 <span class="forecast-summary-meta mono">{{ forecastData?.forecast_mode || reportMode }} · {{ forecastData?.confidence || 'low' }}</span>
               </div>
+              <div v-if="ensembleForecast" class="forecast-ensemble">
+                <span class="forecast-ensemble-chip mono">{{ ensembleForecast.completed_runs || ensembleForecast.runs }}/{{ ensembleForecast.runs }} runs</span>
+                <span class="forecast-ensemble-stat mono">net {{ formatSignedNet(ensembleForecast.mean_net) }} ± {{ ensembleForecast.std_net }}</span>
+                <span class="forecast-ensemble-note">Mean across seeded runs — lower spread means higher confidence.</span>
+              </div>
+              <div v-if="numericForecast" class="forecast-numeric">
+                <div class="forecast-point">
+                  <span class="forecast-point-label">Point estimate</span>
+                  <span class="forecast-point-value mono">{{ numericForecast.point_estimate }}</span>
+                </div>
+                <div class="forecast-point-meta mono">
+                  <span v-if="numericForecast.interval">P10–P90: {{ numericForecast.interval[0] }} – {{ numericForecast.interval[1] }}</span>
+                  <span v-if="numericForecast.anchor !== null && numericForecast.anchor !== undefined">· from current {{ numericForecast.anchor }}</span>
+                </div>
+                <div class="forecast-point-note">Probabilistic estimate, not a guarantee — anchored to market data and blended with historical base rates.</div>
+              </div>
               <div class="forecast-probability-list">
                 <div v-for="row in forecastRows" :key="row.outcome" class="forecast-probability-row">
                   <div class="forecast-row-main">
                     <span class="forecast-outcome">{{ row.outcome }}</span>
-                    <span class="forecast-percent mono">{{ row.percent }}</span>
+                    <span class="forecast-percent mono">{{ row.percent }}<span v-if="row.probability_std" class="forecast-percent-std">±{{ Math.round(row.probability_std * 100) }}%</span></span>
                   </div>
                   <div class="forecast-bar-track">
                     <div class="forecast-bar-fill" :style="{ width: row.percent }"></div>
@@ -30,9 +46,49 @@
                   <p class="forecast-rationale">{{ row.rationale }}</p>
                 </div>
               </div>
+              <div v-if="simulationSignal" class="forecast-signal">
+                <span class="forecast-signal-count mono">{{ simulationSignal.total_actions }} actions · {{ simulationSignal.active_agents }} agents</span>
+                <span class="forecast-signal-split">
+                  <span class="forecast-signal-support">▲ {{ simulationSignal.agents_supporting }} supporting</span>
+                  <span class="forecast-signal-oppose">▼ {{ simulationSignal.agents_opposing }} opposing</span>
+                </span>
+              </div>
               <div v-if="forecastData?.missing_information?.length" class="forecast-missing">
                 Missing: {{ forecastData.missing_information.slice(0, 2).join('; ') }}
               </div>
+              <details v-if="hasForecastDetail" class="forecast-detail">
+                <summary class="forecast-detail-summary">Assumptions, sensitivity &amp; evidence</summary>
+                <div v-if="forecastData.assumptions?.length" class="forecast-detail-group">
+                  <span class="forecast-detail-title">Assumptions</span>
+                  <ul>
+                    <li v-for="(a, i) in forecastData.assumptions" :key="`fa-${i}`">{{ a }}</li>
+                  </ul>
+                </div>
+                <div v-if="forecastData.sensitivity?.length" class="forecast-detail-group">
+                  <span class="forecast-detail-title">Sensitivity</span>
+                  <ul>
+                    <li v-for="(s, i) in forecastData.sensitivity" :key="`fs-${i}`"><strong>{{ s.factor }}:</strong> {{ s.effect }}</li>
+                  </ul>
+                </div>
+                <div v-if="forecastData.evidence_references?.length" class="forecast-detail-group">
+                  <span class="forecast-detail-title">Evidence</span>
+                  <ul>
+                    <li v-for="(e, i) in forecastData.evidence_references.slice(0, 6)" :key="`fe-${i}`">
+                      {{ e.fact }}<em v-if="e.source"> — {{ e.source }}</em>
+                    </li>
+                  </ul>
+                </div>
+                <div v-if="forecastData.missing_information?.length" class="forecast-detail-group">
+                  <span class="forecast-detail-title">Missing information</span>
+                  <ul>
+                    <li v-for="(m, i) in forecastData.missing_information" :key="`fm-${i}`">{{ m }}</li>
+                  </ul>
+                </div>
+                <div v-if="forecastData.limitations" class="forecast-detail-group">
+                  <span class="forecast-detail-title">Limitations</span>
+                  <p class="forecast-detail-text">{{ forecastData.limitations }}</p>
+                </div>
+              </details>
             </div>
             <div class="header-divider"></div>
           </div>
@@ -1871,6 +1927,11 @@ const reportModeLabel = computed(() => {
   return labels[reportMode.value] || reportMode.value
 })
 
+const numericForecast = computed(() => {
+  const n = forecastData.value?.numeric
+  return (n && n.point_estimate !== null && n.point_estimate !== undefined) ? n : null
+})
+
 const forecastRows = computed(() => {
   return (forecastData.value?.probabilities || []).map((row) => {
     const probability = Number(row.probability || 0)
@@ -1884,6 +1945,35 @@ const forecastRows = computed(() => {
 const topForecastPercent = computed(() => {
   return forecastRows.value[0]?.percent || '-'
 })
+
+// Aggregated multi-seed ensemble result (only meaningful when more than one run).
+const ensembleForecast = computed(() => {
+  const e = forecastData.value?.ensemble
+  return (e && e.runs > 1) ? e : null
+})
+
+// Grounded simulation signal (agent support/oppose + participation).
+const simulationSignal = computed(() => {
+  const s = forecastData.value?.simulation_signal
+  return (s && s.total_actions) ? s : null
+})
+
+// Whether there's any qualitative context to show in the collapsible detail block.
+const hasForecastDetail = computed(() => {
+  const f = forecastData.value
+  return !!(f && (
+    f.assumptions?.length ||
+    f.sensitivity?.length ||
+    f.evidence_references?.length ||
+    f.limitations ||
+    f.missing_information?.length
+  ))
+})
+
+const formatSignedNet = (value) => {
+  const n = Number(value || 0)
+  return `${n >= 0 ? '+' : ''}${n.toFixed(2)}`
+}
 
 const benchmarkRows = computed(() => {
   return (benchmarkResult.value?.providers || []).map((provider) => {
@@ -2814,6 +2904,19 @@ watch(() => props.reportId, (newId) => {
   font-weight: 400;
 }
 
+.forecast-numeric {
+  margin: 8px 0 14px 0;
+  padding: 12px 14px;
+  border: 1px solid #E5E7EB;
+  border-radius: 8px;
+  background: #FAFAFA;
+}
+.forecast-point { display: flex; align-items: baseline; justify-content: space-between; }
+.forecast-point-label { font-size: 0.7rem; letter-spacing: 0.08em; text-transform: uppercase; color: #888; }
+.forecast-point-value { font-size: 1.6rem; font-weight: 700; color: #111; }
+.forecast-point-meta { margin-top: 4px; font-size: 0.78rem; color: #555; display: flex; gap: 6px; flex-wrap: wrap; }
+.forecast-point-note { margin-top: 8px; font-size: 0.7rem; color: #999; line-height: 1.4; }
+
 .forecast-summary-panel {
   margin: 0 0 24px 0;
   padding: 16px;
@@ -2901,6 +3004,88 @@ watch(() => props.reportId, (newId) => {
   font-size: 12px;
   color: #92400E;
 }
+
+/* Ensemble spread strip */
+.forecast-ensemble {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 12px;
+  padding: 8px 10px;
+  border: 1px solid #D1FAE5;
+  border-radius: 6px;
+  background: #F0FDF4;
+}
+.forecast-ensemble-chip {
+  font-size: 11px;
+  font-weight: 800;
+  color: #065F46;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: #D1FAE5;
+}
+.forecast-ensemble-stat { font-size: 12px; font-weight: 700; color: #047857; }
+.forecast-ensemble-note { font-size: 11px; color: #6B7280; }
+
+.forecast-percent-std {
+  margin-left: 5px;
+  font-size: 10px;
+  font-weight: 600;
+  color: #9CA3AF;
+}
+
+/* Simulation signal (support vs oppose) */
+.forecast-signal {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid #E5E7EB;
+  font-size: 12px;
+}
+.forecast-signal-count { color: #4B5563; font-weight: 700; }
+.forecast-signal-split { display: flex; gap: 12px; }
+.forecast-signal-support { color: #047857; font-weight: 700; }
+.forecast-signal-oppose { color: #B91C1C; font-weight: 700; }
+
+/* Collapsible qualitative detail */
+.forecast-detail {
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px dashed #D1D5DB;
+}
+.forecast-detail-summary {
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: #374151;
+}
+.forecast-detail-group { margin-top: 10px; }
+.forecast-detail-title {
+  display: block;
+  font-size: 10px;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #6B7280;
+  margin-bottom: 4px;
+}
+.forecast-detail-group ul {
+  margin: 0;
+  padding-left: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.forecast-detail-group li { font-size: 12px; color: #374151; line-height: 1.45; }
+.forecast-detail-group li em { color: #9CA3AF; font-style: italic; }
+.forecast-detail-text { margin: 0; font-size: 12px; color: #4B5563; line-height: 1.5; }
 
 .header-divider {
   height: 1px;

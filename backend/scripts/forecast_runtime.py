@@ -187,6 +187,42 @@ def select_active_agents_for_round(
     return active_agents
 
 
+def resolve_simulation_start_hour(config: Dict[str, Any]) -> int:
+    """Resolve the hour-of-day the simulation clock starts at.
+
+    Without an offset the clock starts at hour 0 (midnight), when agents are
+    asleep (their active_hours and the peak/work windows exclude the small
+    hours). Short or truncated runs then activate zero agents and produce no
+    actions, and every full run wastes its opening hours. Starting at the
+    earliest hour an agent is actually active makes round 0 productive.
+    """
+    time_config = config.get("time_config", {})
+    explicit = time_config.get("start_hour")
+    if isinstance(explicit, (int, float)):
+        return int(explicit) % 24
+
+    # Earliest hour any agent declares itself active.
+    agent_hours = set()
+    for cfg in config.get("agent_configs", []):
+        for hour in (cfg.get("active_hours") or []):
+            try:
+                agent_hours.add(int(hour) % 24)
+            except (TypeError, ValueError):
+                continue
+    if agent_hours:
+        return min(agent_hours)
+
+    # Fall back to the configured peak/morning windows, else a sane morning default.
+    for key in ("peak_hours", "morning_hours", "work_hours"):
+        hours = time_config.get(key) or []
+        if hours:
+            try:
+                return int(min(hours)) % 24
+            except (TypeError, ValueError):
+                continue
+    return 8
+
+
 def _recent_event_response_boost(config: Dict[str, Any], cfg: Dict[str, Any], round_num: int) -> float:
     events = config.get("event_config", {}).get("scheduled_events", [])
     if not events:
@@ -239,6 +275,17 @@ def due_scheduled_events(
             continue
         content = event.get("content") or event.get("title") or event.get("description")
         if content:
+            # Surface numeric surprise/magnitude so agents react to the size of the
+            # catalyst, not just its text (e.g. a CPI print vs consensus).
+            numeric_bits = []
+            if event.get("surprise_bps") is not None:
+                numeric_bits.append(f"surprise {event['surprise_bps']:+g}bps vs consensus")
+            if event.get("actual_vs_consensus") is not None:
+                numeric_bits.append(f"actual vs consensus {event['actual_vs_consensus']:+g}")
+            if event.get("actual") is not None:
+                numeric_bits.append(f"actual={event['actual']}")
+            if numeric_bits:
+                content = f"{content} (" + "; ".join(numeric_bits) + ")"
             due.append(dict(event, content=content))
     return due
 
@@ -270,11 +317,21 @@ def inject_agent_forecast_memory(
         if content:
             memory_lines.append(f"R{item.get('round')} {item.get('action_type')}: {content[:180]}")
 
+    stance_line = (
+        f"Your stance: {agent_config.get('stance', 'neutral')}; "
+        f"sentiment bias: {agent_config.get('sentiment_bias', 0)}; "
+        f"influence weight: {agent_config.get('influence_weight', 1)}."
+    )
+    rationale = agent_config.get("stance_rationale")
+    if rationale:
+        stance_line += f" Why you hold this position: {rationale}"
+    stance_line += " Stay in character — argue from your role and interests, not as a neutral observer."
+
     content = "\n".join([
         "[Forecast Runtime Context]",
         forecast_context,
         f"Current platform: {platform}; round: {round_num}; simulated hour: {simulated_hour}.",
-        f"Your stance: {agent_config.get('stance', 'neutral')}; sentiment bias: {agent_config.get('sentiment_bias', 0)}; influence weight: {agent_config.get('influence_weight', 1)}.",
+        stance_line,
         f"Expected behavior: posts/hour={agent_config.get('posts_per_hour', 0.5)}, comments/hour={agent_config.get('comments_per_hour', 1.0)}, response delay={agent_config.get('response_delay_min', 5)}-{agent_config.get('response_delay_max', 60)} minutes.",
         "Longer memory summary: " + (summary.get("summary") or "No compacted summary yet."),
         "Short-term memory: " + (" | ".join(memory_lines) if memory_lines else "No recent actions yet."),
@@ -305,6 +362,11 @@ def _forecast_context(config: Dict[str, Any]) -> str:
         f"Mode={mode}; horizon={horizon}.",
         f"Prediction target={target.get('question', config.get('simulation_requirement', 'future outcome'))}.",
     ]
+    # Anchor agents to the real current value for quantitative (price/indicator) targets.
+    variable = target.get("variable") or target.get("symbol")
+    current_value = target.get("current_value")
+    if variable and current_value is not None:
+        lines.append(f"Current {variable}={current_value} (reason about the move over the {horizon} horizon).")
     if outcomes:
         lines.append("Outcomes=" + "; ".join(str(outcome) for outcome in outcomes))
     return " ".join(lines)

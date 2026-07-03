@@ -2,12 +2,16 @@
 
 import hashlib
 import json
+import logging
 import os
 import threading
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 from ..config import Config
+
+
+logger = logging.getLogger('mirofish.extraction_cache')
 
 
 class ExtractionCache:
@@ -59,7 +63,6 @@ class ExtractionCache:
         extraction: Dict[str, Any],
     ) -> None:
         path = self._path(file_hash, chunk_hash, ontology_hash)
-        path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "metadata": {
                 "version": self.VERSION,
@@ -70,10 +73,18 @@ class ExtractionCache:
             "extraction": extraction,
         }
         tmp_path = path.with_suffix(".tmp")
-        with self._lock:
-            with tmp_path.open("w", encoding="utf-8") as handle:
-                json.dump(payload, handle, ensure_ascii=False)
-            os.replace(tmp_path, path)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with self._lock:
+                with tmp_path.open("w", encoding="utf-8") as handle:
+                    json.dump(payload, handle, ensure_ascii=False)
+                os.replace(tmp_path, path)
+        except OSError as exc:
+            logger.warning("Skipping NER extraction cache write: path=%s error=%s", path, exc)
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     def _path(self, file_hash: str, chunk_hash: str, ontology_hash: str) -> Path:
         cache_key = self.hash_text("|".join([self.VERSION, file_hash, chunk_hash, ontology_hash]))

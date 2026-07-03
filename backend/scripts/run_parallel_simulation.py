@@ -160,6 +160,7 @@ from forecast_runtime import (
     due_scheduled_events,
     inject_agent_forecast_memory,
     record_actions_to_short_memory,
+    resolve_simulation_start_hour,
     select_active_agents_for_round,
     update_memory_summaries,
 )
@@ -1154,15 +1155,17 @@ async def run_twitter_simulation(
             log_info(f"Rounds truncated: {original_rounds} -> {total_rounds} (max_rounds={max_rounds})")
     
     start_time = datetime.now()
-    
+    start_hour = resolve_simulation_start_hour(config)
+    start_minutes = start_hour * 60
+
     for round_num in range(total_rounds):
         # Check if received exit signal
         if _shutdown_event and _shutdown_event.is_set():
             if main_logger:
                 main_logger.info(f"Received exit signal，at round {round_num + 1} stop simulation")
             break
-        
-        simulated_minutes = round_num * minutes_per_round
+
+        simulated_minutes = start_minutes + round_num * minutes_per_round
         simulated_hour = (simulated_minutes // 60) % 24
         simulated_day = simulated_minutes // (60 * 24) + 1
 
@@ -1388,15 +1391,17 @@ async def run_reddit_simulation(
             log_info(f"Rounds truncated: {original_rounds} -> {total_rounds} (max_rounds={max_rounds})")
     
     start_time = datetime.now()
-    
+    start_hour = resolve_simulation_start_hour(config)
+    start_minutes = start_hour * 60
+
     for round_num in range(total_rounds):
         # Check if received exit signal
         if _shutdown_event and _shutdown_event.is_set():
             if main_logger:
                 main_logger.info(f"Received exit signal，at round {round_num + 1} stop simulation")
             break
-        
-        simulated_minutes = round_num * minutes_per_round
+
+        simulated_minutes = start_minutes + round_num * minutes_per_round
         simulated_hour = (simulated_minutes // 60) % 24
         simulated_day = simulated_minutes // (60 * 24) + 1
 

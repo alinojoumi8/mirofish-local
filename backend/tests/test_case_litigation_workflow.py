@@ -1,10 +1,68 @@
 import json
 from pathlib import Path
 
-from app.models.case import CaseManager, DocumentType, normalize_prediction_settings
+from app.models.case import (
+    CaseManager,
+    DocumentType,
+    build_prediction_snapshot,
+    normalize_prediction_settings,
+)
 from app.models.project import Project, ProjectManager, ProjectStatus
 from app.services.graph_builder import GraphBuilderService
 from app.services.simulation_runner import SimulationRunner
+
+
+def test_build_prediction_snapshot_flattens_forecast():
+    forecast = {
+        "forecast_mode": "legal_case",
+        "forecast_horizon": "next_procedural_decision",
+        "confidence": "medium",
+        "probabilities": [
+            {"outcome": "Moving party substantially succeeds", "probability": 0.55},
+            {"outcome": "Mixed or partial result", "probability": 0.30},
+            {"outcome": "Opposing party substantially succeeds", "probability": 0.15},
+        ],
+        "numeric": {"point_estimate": 4200.5},
+    }
+    snap = build_prediction_snapshot(forecast, report_id="rep_1", simulation_id="sim_1")
+
+    assert snap["Moving party substantially succeeds"] == 0.55
+    assert snap["point_estimate"] == 4200.5
+    assert snap["confidence"] == "medium"
+    # Non-comparable context is tucked under _meta so compare ignores it.
+    assert snap["_meta"]["report_id"] == "rep_1"
+    assert snap["_meta"]["forecast_mode"] == "legal_case"
+
+
+def test_record_prediction_snapshot_enables_real_version_compare(tmp_path, monkeypatch):
+    monkeypatch.setattr(CaseManager, "CASES_DIR", str(tmp_path / "cases"))
+    case = CaseManager.create_case(name="Doe v Roe", simulation_requirement="Predict outcome.")
+
+    v1 = CaseManager.create_version(case.case_id, project_id="proj_1", graph_id="graph_1")
+    v2 = CaseManager.create_version(case.case_id, project_id="proj_2", graph_id="graph_2")
+
+    snap1 = build_prediction_snapshot(
+        {"confidence": "low", "probabilities": [{"outcome": "Win", "probability": 0.40}]},
+        report_id="rep_1", simulation_id="sim_1",
+    )
+    snap2 = build_prediction_snapshot(
+        {"confidence": "medium", "probabilities": [{"outcome": "Win", "probability": 0.62}]},
+        report_id="rep_2", simulation_id="sim_2",
+    )
+    CaseManager.record_prediction_snapshot(case.case_id, v1.version_id, snap1, report_id="rep_1", simulation_id="sim_1")
+    CaseManager.record_prediction_snapshot(case.case_id, v2.version_id, snap2, report_id="rep_2", simulation_id="sim_2")
+
+    # Snapshot + linkage persisted.
+    reloaded = CaseManager.get_version(case.case_id, v1.version_id)
+    assert reloaded.prediction_snapshots[-1]["Win"] == 0.40
+    assert "rep_1" in reloaded.report_ids
+    assert reloaded.status == "reported"
+
+    diff = CaseManager.compare_prediction_versions(case.case_id, v1.version_id, v2.version_id)
+    changed = diff["changed_predictions"]
+    assert "_meta" not in changed  # metadata excluded from comparison
+    assert changed["Win"]["delta"] == 0.22
+    assert changed["confidence"] == {"from": "low", "to": "medium"}
 
 
 def test_case_manager_creates_versions_and_preserves_document_provenance(tmp_path, monkeypatch):

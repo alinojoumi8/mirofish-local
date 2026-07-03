@@ -35,6 +35,28 @@ def test_report_mode_is_serialized_and_normalized():
     assert normalize_report_mode("unsupported") == "prediction"
 
 
+def test_report_manager_uses_writable_fallback_when_reports_dir_is_blocked(tmp_path, monkeypatch):
+    blocked_reports_path = tmp_path / "reports"
+    fallback_reports_path = tmp_path / "reports_local"
+    blocked_reports_path.write_text("not a directory", encoding="utf-8")
+    monkeypatch.setattr(ReportManager, "REPORTS_DIR", str(blocked_reports_path))
+    monkeypatch.setattr(ReportManager, "FALLBACK_REPORTS_DIR", str(fallback_reports_path), raising=False)
+
+    report = Report(
+        report_id="report_fallback",
+        simulation_id="sim_1",
+        graph_id="graph_1",
+        simulation_requirement="test",
+        status=ReportStatus.COMPLETED,
+        markdown_content="# Report",
+    )
+
+    ReportManager.save_report(report)
+
+    assert (fallback_reports_path / report.report_id / "meta.json").exists()
+    assert ReportManager.get_report(report.report_id).report_id == report.report_id
+
+
 def test_validate_report_output_warns_about_failed_interviews():
     report = Report(
         report_id="report_1",

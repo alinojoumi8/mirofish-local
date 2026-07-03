@@ -52,6 +52,8 @@
         <Step3Simulation
           :simulationId="currentSimulationId"
           :maxRounds="maxRounds"
+          :runtimeMode="runtimeMode"
+          :ensembleRuns="ensembleRuns"
           :minutesPerRound="minutesPerRound"
           :projectData="projectData"
           :graphData="graphData"
@@ -89,7 +91,11 @@ const viewMode = ref('split')
 const currentSimulationId = ref(route.params.simulationId)
 // Get maxRounds from query param during init to ensure child components get value immediately
 const maxRounds = ref(route.query.maxRounds ? parseInt(route.query.maxRounds) : null)
+// Runtime mode ('realistic' default, 'fast' for cheap preview) from query param
+const runtimeMode = ref(route.query.runtimeMode === 'fast' ? 'fast' : 'realistic')
 const minutesPerRound = ref(30) // Default 30 minutes per round
+// Number of seeded ensemble runs configured in Step 2 (>1 enables the ensemble action)
+const ensembleRuns = ref(1)
 const projectData = ref(null)
 const graphData = ref(null)
 const graphLoading = ref(false)
@@ -208,12 +214,17 @@ const loadSimulationData = async () => {
     if (simRes.success && simRes.data) {
       const simData = simRes.data
       
-      // Get simulation config to get minutes_per_round
+      // Get simulation config to get minutes_per_round + ensemble_runs
       try {
         const configRes = await getSimulationConfig(currentSimulationId.value)
         if (configRes.success && configRes.data?.time_config?.minutes_per_round) {
           minutesPerRound.value = configRes.data.time_config.minutes_per_round
           addLog(`Time config: ${minutesPerRound.value} min/round`)
+        }
+        const configuredRuns = Number(configRes.data?.ensemble_runs)
+        if (Number.isFinite(configuredRuns) && configuredRuns > 1) {
+          ensembleRuns.value = configuredRuns
+          addLog(`Ensemble configured: ${ensembleRuns.value} seeded runs available`)
         }
       } catch (configErr) {
         addLog(`Failed to get time config, using default: ${minutesPerRound.value} min/round`)

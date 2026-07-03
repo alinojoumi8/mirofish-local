@@ -22,6 +22,7 @@ from ..utils.logger import get_logger
 from .entity_reader import EntityNode
 from ..storage import GraphStorage
 from .forecasting import domain_guidance_for_forecast, normalize_forecast_settings
+from .stance import entity_role, infer_stance, stance_verb
 
 logger = get_logger('mirofish.oasis_profile')
 
@@ -265,7 +266,13 @@ class OasisProfileGenerator:
 
         # Build context information
         context = self._build_entity_context(entity)
-        
+
+        # Derive the entity's real stance/role from the graph so the persona is
+        # grounded in the document instead of a generic "neutral forecaster".
+        stance_info = infer_stance(entity, self.forecast_settings.get("prediction_target"))
+        role = entity_role(entity)
+        stance_directive = self._build_stance_directive(name, role, stance_info)
+
         if use_llm:
             # Use LLM to generate detailed persona
             profile_data = self._generate_profile_with_llm(
@@ -273,7 +280,8 @@ class OasisProfileGenerator:
                 entity_type=entity_type,
                 entity_summary=entity.summary,
                 entity_attributes=entity.attributes,
-                context=context
+                context=context,
+                stance_directive=stance_directive
             )
         else:
             # Use rules to generate basic persona
@@ -283,7 +291,13 @@ class OasisProfileGenerator:
                 entity_summary=entity.summary,
                 entity_attributes=entity.attributes
             )
-        
+
+        # Overwrite the generic forecast fields with stance- and role-aware text so
+        # the agent's system prompt clearly states who it is and where it stands.
+        profile_data = self._apply_stance_fields(
+            profile_data, name, entity_type, entity.summary, stance_info, role
+        )
+
         return OasisAgentProfile(
             user_id=user_id,
             user_name=user_name,
@@ -492,7 +506,8 @@ class OasisProfileGenerator:
         entity_type: str,
         entity_summary: str,
         entity_attributes: Dict[str, Any],
-        context: str
+        context: str,
+        stance_directive: str = ""
     ) -> Dict[str, Any]:
         """
         Use LLM to generate very detailed persona
@@ -506,11 +521,11 @@ class OasisProfileGenerator:
 
         if is_individual:
             prompt = self._build_individual_persona_prompt(
-                entity_name, entity_type, entity_summary, entity_attributes, context
+                entity_name, entity_type, entity_summary, entity_attributes, context, stance_directive
             )
         else:
             prompt = self._build_group_persona_prompt(
-                entity_name, entity_type, entity_summary, entity_attributes, context
+                entity_name, entity_type, entity_summary, entity_attributes, context, stance_directive
             )
 
         # Try multiple times until successful or max retry attempts reached
@@ -720,6 +735,74 @@ The persona must not generate generic welcome posts. All public actions should r
             return "market/economy stakeholder"
         return "general forecaster"
 
+    def _build_stance_directive(self, entity_name: str, role: str, stance_info: Dict[str, Any]) -> str:
+        """Instruction injected into the LLM persona prompt so the generated persona
+        reflects the entity's real position toward the prediction target."""
+        stance = stance_info.get("stance", "neutral")
+        if stance == "neutral":
+            return ""
+        target = self.forecast_settings.get("prediction_target", {})
+        question = target.get("question") or "the forecast target"
+        verb = stance_verb(stance)
+        rationale = stance_info.get("rationale") or ""
+        lines = [
+            "\n## Required Stance (ground the persona in this)",
+            f"- {entity_name} acts as: {role}.",
+            f"- Position: this entity {verb} the matter being forecast: \"{question}\".",
+        ]
+        if rationale:
+            lines.append(f"- Evidence from the source material: {rationale}")
+        lines.append(
+            "- The persona, bio, positions/views, and behavior MUST consistently reflect this "
+            "stance and role. Do NOT write a neutral generic forecaster."
+        )
+        return "\n".join(lines) + "\n"
+
+    def _apply_stance_fields(
+        self,
+        profile_data: Dict[str, Any],
+        entity_name: str,
+        entity_type: str,
+        entity_summary: str,
+        stance_info: Dict[str, Any],
+        role: str,
+    ) -> Dict[str, Any]:
+        """Overwrite the generic forecast fields with stance- and role-aware text.
+
+        Runs after persona generation (LLM or rule based) so the agent's effective
+        system prompt states who it is and where it stands. No-op for neutral agents
+        (keeps the existing generic forecaster framing)."""
+        stance = stance_info.get("stance", "neutral")
+        if stance == "neutral":
+            return profile_data
+
+        target = self.forecast_settings.get("prediction_target", {})
+        question = target.get("question") or "the forecast target"
+        verb = stance_verb(stance)
+        lean = {"supportive": "positive", "opposing": "negative", "mixed": "mixed"}.get(stance, "mixed")
+        rationale = stance_info.get("rationale") or ""
+
+        public_line = f"{entity_name}, as {role}, {verb} the matter in question: {question}."
+        if rationale:
+            public_line += f" Evidence: {rationale}"
+
+        profile_data["private_beliefs"] = (
+            f"{entity_name} privately leans {lean} on \"{question}\" and updates probabilities "
+            f"from evidence and self-interest as {role}."
+        )
+        profile_data["public_position"] = public_line
+        profile_data["goals"] = (
+            f"Advance and defend a {stance} position on \"{question}\" while staying credible and fact-based."
+        )
+        if rationale:
+            profile_data["known_facts"] = (f"{rationale} {entity_summary or ''}").strip()[:600]
+
+        # Ensure the persona text itself opens with the stance so OASIS uses it.
+        persona = profile_data.get("persona") or entity_summary or f"{entity_name} is a {entity_type}."
+        if verb.split()[0] not in persona.lower()[:300]:
+            profile_data["persona"] = f"{public_line} {persona}"
+        return profile_data
+
     def _apply_forecast_profile_fields(
         self,
         profile_data: Dict[str, Any],
@@ -759,7 +842,8 @@ The persona must not generate generic welcome posts. All public actions should r
         entity_type: str,
         entity_summary: str,
         entity_attributes: Dict[str, Any],
-        context: str
+        context: str,
+        stance_directive: str = ""
     ) -> str:
         """Build detailed persona prompt for individual entities"""
 
@@ -775,7 +859,7 @@ Entity Attributes: {attrs_str}
 
 Context Information:
 {context_str}
-
+{stance_directive}
 {self._forecast_prompt_block()}
 
 Please generate JSON containing the following fields:
@@ -810,7 +894,8 @@ Important:
         entity_type: str,
         entity_summary: str,
         entity_attributes: Dict[str, Any],
-        context: str
+        context: str,
+        stance_directive: str = ""
     ) -> str:
         """Build detailed persona prompt for group/institutional entities"""
 
@@ -826,7 +911,7 @@ Entity Attributes: {attrs_str}
 
 Context Information:
 {context_str}
-
+{stance_directive}
 {self._forecast_prompt_block()}
 
 Please generate JSON containing the following fields:

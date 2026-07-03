@@ -196,22 +196,30 @@ const initProject = async () => {
 
 const handleNewProject = async () => {
   const pending = getPendingUpload()
-  if (!pending.isPending || pending.files.length === 0) {
-    error.value = 'No pending files found.'
-    addLog('Error: No pending files found for new project.')
+  const pendingUrls = pending.urls || []
+  if (!pending.isPending || (pending.files.length === 0 && pendingUrls.length === 0)) {
+    error.value = 'No pending files or URLs found.'
+    addLog('Error: No pending files or URLs found for new project.')
     return
   }
-  
+
   try {
     loading.value = true
     currentPhase.value = 0
     ontologyProgress.value = { message: 'Uploading and analyzing docs...' }
-    addLog('Starting ontology generation: Uploading files...')
-    
+    const sourceSummary = [
+      pending.files.length ? `${pending.files.length} file(s)` : '',
+      pendingUrls.length ? `${pendingUrls.length} URL(s)` : '',
+    ].filter(Boolean).join(' + ')
+    addLog(`Starting ontology generation: ${sourceSummary}...`)
+
     const formData = new FormData()
     pending.files.forEach(f => formData.append('files', f))
+    pendingUrls.forEach(u => formData.append('urls', u))
     formData.append('simulation_requirement', pending.simulationRequirement)
-    
+    // Attach to an existing case (as a new version) when the upload came from a case.
+    if (pending.caseId) formData.append('case_id', pending.caseId)
+
     const res = await generateOntology(formData)
     if (res.success) {
       clearPendingUpload()

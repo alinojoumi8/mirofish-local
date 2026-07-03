@@ -4,7 +4,7 @@ import time
 
 from app.config import Config
 from app.services.graph_builder import GraphBuilderService
-from app.storage.embedding_service import EmbeddingCache, EmbeddingProviderInfo
+from app.storage.embedding_service import EmbeddingCache, EmbeddingProviderInfo, RETRIEVAL_DOCUMENT
 from app.storage.extraction_cache import ExtractionCache
 from app.storage.neo4j_storage import Neo4jStorage
 from app.storage.ner_extractor import NERExtractor
@@ -240,6 +240,25 @@ def test_neo4j_batch_extraction_cache_skips_llm_on_rebuild(tmp_path):
     assert first_ids == second_ids
 
 
+def test_extraction_cache_set_ignores_unwritable_cache_shard(tmp_path):
+    cache = ExtractionCache(tmp_path)
+    file_hash = "file-123"
+    chunk_hash = ExtractionCache.hash_text("same chunk")
+    ontology_hash = ExtractionCache.hash_ontology({"entity_types": ["Party"], "edge_types": []})
+    cache_path = cache._path(file_hash, chunk_hash, ontology_hash)
+
+    cache_path.parent.write_text("not a directory", encoding="utf-8")
+
+    cache.set(
+        file_hash,
+        chunk_hash,
+        ontology_hash,
+        {"entities": [{"name": "Entity", "type": "Party"}], "relations": []},
+    )
+
+    assert cache.get(file_hash, chunk_hash, ontology_hash) is None
+
+
 def test_embedding_cache_persists_vectors_by_provider_model_task_and_text(tmp_path):
     cache = EmbeddingCache(tmp_path)
     provider = EmbeddingProviderInfo(
@@ -255,6 +274,19 @@ def test_embedding_cache_persists_vectors_by_provider_model_task_and_text(tmp_pa
     assert cache.get(provider.provider_id, "RETRIEVAL_DOCUMENT", "Alpha Inc.") == vector
     assert cache.get(provider.provider_id, "RETRIEVAL_QUERY", "Alpha Inc.") is None
     assert cache.get("other-provider", "RETRIEVAL_DOCUMENT", "Alpha Inc.") is None
+
+
+def test_embedding_cache_set_ignores_unwritable_cache_shard(tmp_path):
+    cache = EmbeddingCache(tmp_path)
+    provider_id = "ollama:nomic-embed-text:768"
+    text = "Alpha Inc."
+    cache_path = cache._path(provider_id, RETRIEVAL_DOCUMENT, text)
+
+    cache_path.parent.write_text("not a directory", encoding="utf-8")
+
+    cache.set(provider_id, RETRIEVAL_DOCUMENT, text, [0.1] * 768)
+
+    assert cache.get(provider_id, RETRIEVAL_DOCUMENT, text) is None
 
 
 class BatchEmbedding:

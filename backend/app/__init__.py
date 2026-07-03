@@ -4,12 +4,13 @@ MiroFish Backend - Flask Application Factory
 
 import os
 import warnings
+import time
 
 # Suppress multiprocessing resource_tracker warnings (from third-party libraries like transformers)
 # Must be set before all other imports
 warnings.filterwarnings("ignore", message=".*resource_tracker.*")
 
-from flask import Flask, request
+from flask import Flask, g, request
 from flask_cors import CORS
 
 from .config import Config
@@ -74,23 +75,54 @@ def create_app(config_class=Config):
     # Request logging middleware
     @app.before_request
     def log_request():
+        g.request_started_at = time.perf_counter()
         logger = get_logger('mirofish.request')
-        logger.debug(f"Request: {request.method} {request.path}")
+        logger.debug("Request started: %s %s", request.method, request.path)
         if request.content_type and 'json' in request.content_type:
-            logger.debug(f"Request body: {request.get_json(silent=True)}")
+            payload = request.get_json(silent=True)
+            if isinstance(payload, dict):
+                logger.debug(
+                    "Request JSON keys: %s %s keys=%s",
+                    request.method,
+                    request.path,
+                    ",".join(sorted(payload.keys())),
+                )
+            else:
+                logger.debug("Request JSON body: %s %s body=%s", request.method, request.path, payload)
 
     @app.after_request
     def log_response(response):
         logger = get_logger('mirofish.request')
-        logger.debug(f"Response: {response.status_code}")
+        started_at = getattr(g, "request_started_at", None)
+        duration_ms = (time.perf_counter() - started_at) * 1000 if started_at else 0
+        message = "HTTP %s %s -> %s duration_ms=%.1f"
+        args = (request.method, request.path, response.status_code, duration_ms)
+        if response.status_code >= 500:
+            logger.error(message, *args)
+        elif response.status_code >= 400:
+            logger.warning(message, *args)
+        else:
+            logger.debug(message, *args)
         return response
 
+    @app.teardown_request
+    def log_unhandled_exception(exc):
+        if exc is not None:
+            logger = get_logger('mirofish.request')
+            logger.error(
+                "Unhandled exception during %s %s",
+                request.method,
+                request.path,
+                exc_info=(type(exc), exc, exc.__traceback__),
+            )
+
     # Register blueprints
-    from .api import graph_bp, simulation_bp, report_bp, status_bp
+    from .api import graph_bp, simulation_bp, report_bp, status_bp, market_bp
     app.register_blueprint(status_bp, url_prefix='/api')
     app.register_blueprint(graph_bp, url_prefix='/api/graph')
     app.register_blueprint(simulation_bp, url_prefix='/api/simulation')
     app.register_blueprint(report_bp, url_prefix='/api/report')
+    app.register_blueprint(market_bp, url_prefix='/api/market')
 
     # Health check
     @app.route('/health')
@@ -101,4 +133,3 @@ def create_app(config_class=Config):
         logger.info("MiroFish-Offline Backend startup complete")
 
     return app
-

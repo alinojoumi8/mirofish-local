@@ -1,4 +1,15 @@
 import service, { requestWithRetry } from './index'
+import { resolveApiBaseUrl } from './baseUrl'
+
+/**
+ * Build the URL for the diagnostics JSON export (a file download / send_file attachment).
+ * Returned as a URL rather than an axios call so the browser handles the download directly.
+ * @param {String} simulationId
+ */
+export const getDiagnosticsExportUrl = (simulationId) => {
+  const base = resolveApiBaseUrl(import.meta.env)
+  return `${base}/api/simulation/${simulationId}/diagnostics/export`
+}
 
 /**
  * Create simulation
@@ -199,4 +210,24 @@ export const interviewAgents = (data) => {
  */
 export const getSimulationHistory = (limit = 20) => {
   return service.get('/api/simulation/history', { params: { limit } })
+}
+
+/**
+ * Run the prepared simulation multiple times with different seeds and aggregate the
+ * grounded forecast signal into a calibrated distribution (persisted to
+ * ensemble_signal.json, which the report's forecast then prefers over a single run).
+ * Returns immediately with a task_id; poll getEnsembleStatus for progress.
+ * @param {Object} data - { simulation_id, runs?, max_rounds?, enable_graph_memory_update? }
+ */
+export const runEnsemble = (data) => {
+  return service.post('/api/simulation/run-ensemble', data)
+}
+
+/**
+ * Query ensemble progress by task_id (live progress) or read the latest persisted
+ * ensemble_signal by simulation_id.
+ * @param {Object} data - { task_id } or { simulation_id }
+ */
+export const getEnsembleStatus = (data) => {
+  return service.post('/api/simulation/run-ensemble/status', data)
 }

@@ -1,3 +1,5 @@
+import logging
+
 import requests
 
 from app.utils.llm_client import LLMClient
@@ -26,6 +28,24 @@ class FakeResponse:
                 {"type": "text", "text": "OK"},
             ]
         }
+
+
+class CapturingHandler(logging.Handler):
+    def __init__(self):
+        super().__init__()
+        self.records = []
+
+    def emit(self, record):
+        self.records.append(record)
+
+
+def capture_logger(name):
+    target_logger = logging.getLogger(name)
+    handler = CapturingHandler()
+    previous_level = target_logger.level
+    target_logger.setLevel(logging.DEBUG)
+    target_logger.addHandler(handler)
+    return target_logger, handler, previous_level
 
 
 def test_anthropic_transport_posts_messages_and_extracts_text(monkeypatch):
@@ -88,7 +108,19 @@ def test_anthropic_transport_retries_temporary_dns_failures(monkeypatch):
         timeout=12,
     )
 
-    result = client.chat([{"role": "user", "content": "Reply OK"}])
+    target_logger, handler, previous_level = capture_logger("mirofish.llm_client")
+    try:
+        result = client.chat([{"role": "user", "content": "Reply OK"}])
+    finally:
+        target_logger.removeHandler(handler)
+        target_logger.setLevel(previous_level)
 
     assert result == "OK"
     assert attempts["count"] == 2
+    assert any(
+        record.levelno == logging.WARNING
+        and "Anthropic-compatible LLM request failed" in record.getMessage()
+        and "attempt 1/5" in record.getMessage()
+        and "temporary DNS failure" in record.getMessage()
+        for record in handler.records
+    )

@@ -35,6 +35,42 @@ def _json_bool(value, default=False):
     return bool(value)
 
 
+def _record_case_snapshot(report):
+    """Persist a prediction snapshot onto the report's case version (if the report's
+    simulation belongs to a case) so cross-version prediction comparison has real data.
+
+    Best-effort: a storage error here must never fail an otherwise-successful report.
+    """
+    try:
+        if not report or not getattr(report, "forecast", None):
+            return
+        state = SimulationManager().get_simulation(report.simulation_id)
+        if not state or not getattr(state, "project_id", None):
+            return
+        project = ProjectManager.get_project(state.project_id)
+        if not project or not project.case_id or not project.case_version_id:
+            return
+        from ..models.case import CaseManager, build_prediction_snapshot
+        snapshot = build_prediction_snapshot(
+            report.forecast,
+            report_id=report.report_id,
+            simulation_id=report.simulation_id,
+        )
+        CaseManager.record_prediction_snapshot(
+            project.case_id,
+            project.case_version_id,
+            snapshot,
+            report_id=report.report_id,
+            simulation_id=report.simulation_id,
+        )
+        logger.info(
+            "Recorded prediction snapshot: case=%s version=%s report=%s",
+            project.case_id, project.case_version_id, report.report_id,
+        )
+    except Exception as exc:
+        logger.warning("Failed to record case prediction snapshot: %s", exc)
+
+
 # ============== Report Generation Interface ==============
 
 @report_bp.route('/generate', methods=['POST'])
@@ -162,6 +198,7 @@ def generate_report():
                 report = agent.generate_report(progress_callback=progress_callback, report_id=report_id)
                 ReportManager.save_report(report)
                 if report.status in [ReportStatus.COMPLETED, ReportStatus.NEEDS_REVIEW]:
+                    _record_case_snapshot(report)
                     task_manager.complete_task(task_id, result={
                         "report_id": report.report_id,
                         "simulation_id": simulation_id,
@@ -479,6 +516,7 @@ def resume_report(report_id: str):
 
                 resumed = agent.resume_report(report, progress_callback=progress_callback)
                 if resumed.status in [ReportStatus.COMPLETED, ReportStatus.NEEDS_REVIEW]:
+                    _record_case_snapshot(resumed)
                     task_manager.complete_task(task_id, result={
                         "report_id": resumed.report_id,
                         "simulation_id": resumed.simulation_id,

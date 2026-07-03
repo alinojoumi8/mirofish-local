@@ -161,9 +161,17 @@ const handleNextStep = (params = {}) => {
     params: { simulationId: currentSimulationId.value }
   }
 
-  // If custom rounds exist, pass via query parameters
+  // Pass custom rounds and runtime mode via query parameters
+  const query = {}
   if (params.maxRounds) {
-    routeParams.query = { maxRounds: params.maxRounds }
+    query.maxRounds = params.maxRounds
+  }
+  if (params.runtimeMode) {
+    query.runtimeMode = params.runtimeMode
+    addLog(`Runtime mode: ${params.runtimeMode}`)
+  }
+  if (Object.keys(query).length) {
+    routeParams.query = query
   }
 
   // Navigate to Step 3 page

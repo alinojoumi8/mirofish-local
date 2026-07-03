@@ -81,7 +81,6 @@ class EmbeddingCache:
 
     def set(self, provider_id: str, task_type: str, text: str, vector: List[float]) -> None:
         path = self._path(provider_id, task_type, text)
-        path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "metadata": {
                 "version": self.VERSION,
@@ -92,10 +91,18 @@ class EmbeddingCache:
             "vector": vector,
         }
         tmp_path = path.with_suffix(".tmp")
-        with self._lock:
-            with tmp_path.open("w", encoding="utf-8") as handle:
-                json.dump(payload, handle, ensure_ascii=False)
-            os.replace(tmp_path, path)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with self._lock:
+                with tmp_path.open("w", encoding="utf-8") as handle:
+                    json.dump(payload, handle, ensure_ascii=False)
+                os.replace(tmp_path, path)
+        except OSError as exc:
+            logger.warning("Skipping embedding cache write: path=%s error=%s", path, exc)
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     def _path(self, provider_id: str, task_type: str, text: str) -> Path:
         cache_key = self._hash_text("|".join([

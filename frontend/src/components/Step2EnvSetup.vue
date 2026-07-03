@@ -97,6 +97,53 @@
                 </select>
               </label>
             </div>
+
+            <!-- Macro / price quantitative target (predict a number, not just a bucket) -->
+            <div class="macro-target-panel" v-if="forecastMode === 'market_economy'">
+              <div class="macro-target-header">
+                <label class="macro-toggle">
+                  <input type="checkbox" v-model="macroEnabled" :disabled="forecastControlsLocked" />
+                  <span>Quantitative target (predict a numeric value/price)</span>
+                </label>
+                <span v-if="marketStatus" class="market-status-badge" :class="marketStatus.enabled ? 'on' : 'off'">
+                  <template v-if="marketStatus.enabled">
+                    Market data: {{ marketStatus.provider }}<template v-if="marketStatus.fred_configured"> · FRED ✓</template>
+                  </template>
+                  <template v-else>Market data off — enter bands manually</template>
+                </span>
+              </div>
+              <div v-if="macroEnabled" class="macro-target-grid">
+                <label class="forecast-field">
+                  <span class="forecast-label">Target type</span>
+                  <select v-model="macroKind" :disabled="forecastControlsLocked">
+                    <option value="price">Asset price / return</option>
+                    <option value="indicator">Macro indicator</option>
+                    <option value="event">Discrete event</option>
+                  </select>
+                </label>
+                <label class="forecast-field">
+                  <span class="forecast-label">Variable</span>
+                  <input v-model="macroVariable" :disabled="forecastControlsLocked" placeholder="e.g. S&P 500" />
+                </label>
+                <label class="forecast-field">
+                  <span class="forecast-label">Symbol</span>
+                  <input v-model="macroSymbol" :disabled="forecastControlsLocked" :placeholder="macroKind === 'indicator' ? 'FRED id e.g. CPIAUCSL' : 'e.g. ^GSPC'" />
+                </label>
+                <label class="forecast-field">
+                  <span class="forecast-label">Horizon</span>
+                  <input v-model="macroHorizon" :disabled="forecastControlsLocked" placeholder="1m" />
+                </label>
+                <button type="button" class="macro-fetch-btn" :disabled="forecastControlsLocked || macroResolving || !macroSymbol" @click="fetchMacroTarget">
+                  {{ macroResolving ? 'Fetching…' : 'Fetch current value + bands' }}
+                </button>
+              </div>
+              <div v-if="macroEnabled && macroError" class="macro-error">{{ macroError }}</div>
+              <div v-if="macroEnabled && macroCurrentValue !== null" class="macro-resolved">
+                <span class="mono">Current: {{ macroCurrentValue }}</span>
+                <span v-for="(b, i) in macroBands" :key="i" class="macro-band">{{ b.label }}</span>
+              </div>
+            </div>
+
             <div class="prediction-settings-grid">
               <label class="forecast-field">
                 <span class="forecast-label">Preset</span>
@@ -158,6 +205,12 @@
               <span>{{ forecastSettings.ensemble_runs }} run ensemble</span>
               <span>{{ forecastSettings.prediction_settings?.preset || predictionPreset }}</span>
             </div>
+            <button
+              v-if="awaitingConfig && !forecastControlsLocked"
+              type="button"
+              class="prepare-env-btn"
+              @click="startPrepareSimulation"
+            >Prepare environment →</button>
           </div>
 
           <!-- Profiles Stats -->
@@ -547,7 +600,31 @@
                 <span class="switch-label">Custom</span>
               </label>
             </div>
-            
+
+            <!-- Runtime mode: realistic (grounded, accurate) vs fast preview -->
+            <div class="runtime-mode-row">
+              <span class="runtime-mode-label">Runtime mode</span>
+              <div class="runtime-mode-toggle">
+                <button
+                  type="button"
+                  class="runtime-mode-btn"
+                  :class="{ active: runtimeMode === 'realistic' }"
+                  @click="runtimeMode = 'realistic'"
+                >Realistic</button>
+                <button
+                  type="button"
+                  class="runtime-mode-btn"
+                  :class="{ active: runtimeMode === 'fast' }"
+                  @click="runtimeMode = 'fast'"
+                >Fast preview</button>
+              </div>
+              <span class="runtime-mode-hint">
+                {{ runtimeMode === 'realistic'
+                  ? 'Agents act in character (role + stance) and the graph updates live — more accurate, slower.'
+                  : 'Ungrounded quick run — cheaper and faster, lower accuracy.' }}
+              </span>
+            </div>
+
             <Transition name="fade" mode="out-in">
               <div v-if="useCustomRounds" class="rounds-content custom" key="custom">
                 <div class="slider-display">
@@ -737,8 +814,9 @@ import {
   getPrepareStatus, 
   getSimulationProfilesRealtime,
   getSimulationConfig,
-  getSimulationConfigRealtime 
+  getSimulationConfigRealtime
 } from '../api/simulation'
+import { resolveMarketTarget, getMarketStatus } from '../api/market'
 
 const props = defineProps({
   simulationId: String,  // Passed from parent component
@@ -765,6 +843,25 @@ const showProfilesDetail = ref(true)
 const forecastMode = ref('auto')
 const forecastHorizon = ref('')
 const ensembleRuns = ref(5)
+
+// Whether we're waiting for the user to configure + click Prepare (vs auto-loaded).
+const awaitingConfig = ref(false)
+
+// Macro / price quantitative target
+const macroEnabled = ref(false)
+const macroKind = ref('price')
+const macroVariable = ref('')
+const macroSymbol = ref('')
+const macroHorizon = ref('1m')
+const macroCurrentValue = ref(null)
+const macroBands = ref([])
+const macroBaseRates = ref(null)
+const macroResolving = ref(false)
+const macroError = ref('')
+// Provider availability for the market-data resolver, loaded lazily when the macro
+// panel first becomes visible so the user knows up front whether auto-fetch will work.
+const marketStatus = ref(null)
+const marketStatusLoaded = ref(false)
 const memoryMode = ref('practical')
 const forecastSettings = ref(null)
 const predictionPreset = ref('standard_litigation_prediction')
@@ -785,6 +882,10 @@ let lastLoggedConfigStage = ''
 // Simulation Rounds Configuration
 const useCustomRounds = ref(false) // DefaultUse auto-configured rounds
 const customMaxRounds = ref(40)   // Default recommendation40rounds
+
+// Runtime mode: 'realistic' (default) grounds agents each round in their role,
+// stance, and the forecast target; 'fast' is a cheap ungrounded preview.
+const runtimeMode = ref('realistic')
 
 // Watch stage to update phase
 watch(currentStage, (newStage) => {
@@ -849,6 +950,63 @@ const effectiveForecastLabel = computed(() => {
   return labels[mode] || mode
 })
 
+const loadMarketStatus = async () => {
+  if (marketStatusLoaded.value) return
+  marketStatusLoaded.value = true
+  try {
+    const res = await getMarketStatus()
+    if (res.success && res.data) {
+      marketStatus.value = res.data
+    }
+  } catch (err) {
+    // Non-fatal: the badge just stays hidden and the user can still enter bands manually.
+    console.warn('Failed to load market status:', err)
+  }
+}
+
+// Load provider status the first time the market-economy macro panel is shown.
+watch(forecastMode, (mode) => {
+  if (mode === 'market_economy') loadMarketStatus()
+}, { immediate: true })
+
+const fetchMacroTarget = async () => {
+  if (!macroSymbol.value) return
+  macroResolving.value = true
+  macroError.value = ''
+  try {
+    const res = await resolveMarketTarget(macroSymbol.value.trim(), macroKind.value, macroHorizon.value.trim() || '1m')
+    if (res.success && res.data) {
+      macroCurrentValue.value = res.data.current_value ?? null
+      macroBands.value = res.data.bands || []
+      macroBaseRates.value = res.data.base_rates || null
+      addLog(`Market data: ${macroSymbol.value} current ${macroCurrentValue.value}`)
+    } else {
+      macroError.value = res.error || 'Could not resolve market data; enter bands manually.'
+    }
+  } catch (err) {
+    macroError.value = err.message || 'Market data request failed.'
+  } finally {
+    macroResolving.value = false
+  }
+}
+
+const buildMacroTarget = (baseQuestion) => {
+  const target = {
+    question: baseQuestion,
+    kind: macroKind.value,
+  }
+  if (macroVariable.value.trim()) target.variable = macroVariable.value.trim()
+  if (macroSymbol.value.trim()) target.symbol = macroSymbol.value.trim()
+  if (macroHorizon.value.trim()) target.horizon = macroHorizon.value.trim()
+  if (macroCurrentValue.value !== null) target.current_value = macroCurrentValue.value
+  if (macroBands.value.length) {
+    target.bands = macroBands.value
+    target.outcomes = macroBands.value.map(b => b.label)
+  }
+  if (macroBaseRates.value) target.base_rates = macroBaseRates.value
+  return target
+}
+
 const buildForecastPayload = () => {
   const targetQuestion = props.projectData?.simulation_requirement || 'Forecast the most likely future paths.'
   const predictionSettings = {
@@ -864,14 +1022,15 @@ const buildForecastPayload = () => {
     report_mode: reportMode.value,
     report_depth: reportDepth.value
   }
+  const predictionTarget = (macroEnabled.value && forecastMode.value === 'market_economy')
+    ? buildMacroTarget(targetQuestion)
+    : { question: targetQuestion }
   const payload = {
-    prediction_target: {
-      question: targetQuestion
-    },
+    prediction_target: predictionTarget,
     scenario_pack: scenarioPack.value,
     ensemble_runs: ensembleRuns.value,
     memory_mode: memoryMode.value,
-    prediction_settings: predictionSettings,
+    prediction_settings: { ...predictionSettings, prediction_target: predictionTarget },
     ...predictionSettings
   }
   if (forecastMode.value !== 'auto') {
@@ -964,7 +1123,11 @@ const handleStartSimulation = () => {
     // User chose to keep auto-generated rounds，Do not pass max_rounds Parameter
     addLog(`Start simulation，Use auto-configured rounds: ${autoGeneratedRounds.value} rounds`)
   }
-  
+
+  // Runtime mode: realistic grounds agents each round (slower, more accurate);
+  // fast is a cheap ungrounded preview.
+  params.runtimeMode = runtimeMode.value
+
   emit('next-step', params)
 }
 
@@ -1296,11 +1459,28 @@ watch(() => props.systemLogs?.length, () => {
   })
 })
 
+// If a simulation is already prepared, load it; otherwise let the user configure the
+// forecast controls (mode, macro target, etc.) before clicking Prepare. This keeps the
+// forecast settings actually editable instead of locking them on mount.
+const initPrepare = async () => {
+  try {
+    const res = await getPrepareStatus({ simulation_id: props.simulationId })
+    const st = res?.data?.status
+    if (st === 'ready' || st === 'completed' || res?.data?.already_prepared) {
+      await startPrepareSimulation()
+      return
+    }
+  } catch (e) {
+    // fall through to manual configure
+  }
+  awaitingConfig.value = true
+  addLog('Configure forecast controls, then click Prepare environment')
+}
+
 onMounted(() => {
-  // Automatically start preparation process
   if (props.simulationId) {
     addLog('Step2 Env Setup Initialization')
-    startPrepareSimulation()
+    initPrepare()
   }
 })
 
@@ -1505,6 +1685,27 @@ onUnmounted(() => {
   border-radius: 6px;
   background: #FBFBFB;
 }
+
+.macro-target-panel {
+  margin: 12px 0;
+  padding: 12px;
+  border: 1px dashed #C9C9C9;
+  border-radius: 6px;
+  background: #FFFFFF;
+}
+.macro-target-header { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+.macro-toggle { display: flex; align-items: center; gap: 8px; font-size: 12px; font-weight: 600; color: #333; cursor: pointer; }
+.market-status-badge { font-size: 10px; font-weight: 700; padding: 3px 9px; border-radius: 999px; text-transform: uppercase; letter-spacing: 0.03em; }
+.market-status-badge.on { color: #065F46; background: #D1FAE5; border: 1px solid #A7F3D0; }
+.market-status-badge.off { color: #92400E; background: #FEF3C7; border: 1px solid #FDE68A; }
+.macro-target-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; margin-top: 10px; align-items: end; }
+.macro-fetch-btn { grid-column: 1 / -1; padding: 8px 12px; border: 1px solid #111; background: #111; color: #fff; border-radius: 6px; font-size: 12px; cursor: pointer; }
+.macro-fetch-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.macro-error { margin-top: 8px; font-size: 11px; color: #c0392b; }
+.macro-resolved { margin-top: 8px; display: flex; flex-wrap: wrap; gap: 8px; font-size: 11px; color: #555; }
+.macro-band { padding: 2px 8px; border: 1px solid #E0E0E0; border-radius: 10px; background: #FAFAFA; }
+.prepare-env-btn { margin-top: 12px; width: 100%; padding: 11px; border: none; background: #111; color: #fff; border-radius: 6px; font-size: 13px; font-weight: 600; cursor: pointer; }
+.prepare-env-btn:hover { background: #000; }
 
 .forecast-control-header {
   display: flex;
@@ -2603,6 +2804,48 @@ onUnmounted(() => {
   margin: 24px 0;
   padding-top: 24px;
   border-top: 1px solid #EAEAEA;
+}
+
+.runtime-mode-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.runtime-mode-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: #333;
+  letter-spacing: 0.02em;
+}
+
+.runtime-mode-toggle {
+  display: inline-flex;
+  border: 1px solid #DADADA;
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.runtime-mode-btn {
+  border: none;
+  background: #fff;
+  padding: 5px 12px;
+  font-size: 12px;
+  cursor: pointer;
+  color: #555;
+}
+
+.runtime-mode-btn.active {
+  background: #111;
+  color: #fff;
+}
+
+.runtime-mode-hint {
+  flex: 1 1 100%;
+  font-size: 11px;
+  color: #888;
 }
 
 .rounds-header {

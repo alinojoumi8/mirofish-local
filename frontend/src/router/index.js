@@ -5,12 +5,32 @@ import SimulationView from '../views/SimulationView.vue'
 import SimulationRunView from '../views/SimulationRunView.vue'
 import ReportView from '../views/ReportView.vue'
 import InteractionView from '../views/InteractionView.vue'
+import CasesView from '../views/CasesView.vue'
+import CaseDetailView from '../views/CaseDetailView.vue'
+import CaseCompareView from '../views/CaseCompareView.vue'
 
 const routes = [
   {
     path: '/',
     name: 'Home',
     component: Home
+  },
+  {
+    path: '/cases',
+    name: 'Cases',
+    component: CasesView
+  },
+  {
+    path: '/case/:caseId',
+    name: 'CaseDetail',
+    component: CaseDetailView,
+    props: true
+  },
+  {
+    path: '/case/:caseId/compare',
+    name: 'CaseCompare',
+    component: CaseCompareView,
+    props: true
   },
   {
     path: '/process/:projectId',

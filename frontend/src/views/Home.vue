@@ -4,6 +4,9 @@
     <nav class="navbar" :style="s.navbar">
       <div class="nav-brand" :style="s.navBrand">MIROFISH OFFLINE</div>
       <div class="nav-links" :style="s.navLinks">
+        <a class="cases-link" :style="s.githubLink" style="cursor: pointer;" @click="router.push('/cases')">
+          Cases
+        </a>
         <a href="https://github.com/nikmcfly/MiroFish-Offline" target="_blank" class="github-link" :style="s.githubLink">
           Visit our Github <span>↗</span>
         </a>
@@ -113,6 +116,17 @@
                   </div>
                 </div>
               </div>
+
+              <div :style="{ marginTop: '12px' }">
+                <div :style="s.urlLabel">or paste website link(s) — one per line</div>
+                <textarea
+                  v-model="urlText"
+                  :style="s.urlInput"
+                  placeholder="https://example.com/article"
+                  rows="2"
+                  :disabled="loading"
+                ></textarea>
+              </div>
             </div>
 
             <div :style="s.consoleDivider"><span :style="s.consoleDividerText">Parameters</span></div>
@@ -208,6 +222,8 @@ const s = reactive({
   fileItem: { display: 'flex', alignItems: 'center', background: '#fff', padding: '8px 12px', border: '1px solid #EEE', fontFamily: mono, fontSize: '0.85rem' },
   fileName: { flex: '1', margin: '0 10px' },
   removeBtn: { background: 'none', border: 'none', cursor: 'pointer', fontSize: '1.2rem', color: '#999' },
+  urlLabel: { fontFamily: mono, fontSize: '0.72rem', color: '#999', marginBottom: '6px' },
+  urlInput: { width: '100%', border: '1px solid #DDD', background: '#FAFAFA', padding: '10px 12px', fontFamily: mono, fontSize: '0.82rem', lineHeight: '1.5', resize: 'vertical', outline: 'none', boxSizing: 'border-box' },
   consoleDivider: { display: 'flex', alignItems: 'center', margin: '10px 0', borderTop: '1px solid #EEE' },
   consoleDividerText: { padding: '0 15px', fontFamily: mono, fontSize: '0.7rem', color: '#BBB', letterSpacing: '1px' },
   inputWrapper: { position: 'relative', border: '1px solid #DDD', background: '#FAFAFA' },
@@ -229,13 +245,19 @@ const router = useRouter()
 
 const formData = ref({ simulationRequirement: '' })
 const files = ref([])
+const urlText = ref('')
 const loading = ref(false)
 const error = ref('')
 const isDragOver = ref(false)
 const fileInput = ref(null)
 
+const parsedUrls = computed(() =>
+  urlText.value.split(/[\s,]+/).map(u => u.trim()).filter(Boolean)
+)
+
 const canSubmit = computed(() => {
-  return formData.value.simulationRequirement.trim() !== '' && files.value.length > 0
+  return formData.value.simulationRequirement.trim() !== '' &&
+    (files.value.length > 0 || parsedUrls.value.length > 0)
 })
 
 const triggerFileInput = () => { if (!loading.value) fileInput.value?.click() }
@@ -257,7 +279,7 @@ const scrollToBottom = () => { window.scrollTo({ top: document.body.scrollHeight
 const startSimulation = () => {
   if (!canSubmit.value || loading.value) return
   import('../store/pendingUpload.js').then(({ setPendingUpload }) => {
-    setPendingUpload(files.value, formData.value.simulationRequirement)
+    setPendingUpload(files.value, formData.value.simulationRequirement, parsedUrls.value)
     router.push({ name: 'Process', params: { projectId: 'new' } })
   })
 }

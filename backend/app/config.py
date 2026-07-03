@@ -81,6 +81,16 @@ class Config:
         os.path.join(UPLOAD_FOLDER, 'cache', 'embeddings')
     )
 
+    # Market data configuration (for macroeconomic / price forecasting)
+    # Provider: 'auto' (Yahoo for prices, FRED for indicators), or 'none' to stay fully offline.
+    MARKET_DATA_PROVIDER = os.environ.get('MARKET_DATA_PROVIDER', 'auto').strip().lower()
+    FRED_API_KEY = os.environ.get('FRED_API_KEY', '')
+    MARKET_DATA_CACHE_DIR = os.environ.get(
+        'MARKET_DATA_CACHE_DIR',
+        os.path.join(UPLOAD_FOLDER, 'cache', 'market')
+    )
+    MARKET_DATA_CACHE_TTL = int(os.environ.get('MARKET_DATA_CACHE_TTL', '3600'))  # seconds
+
     # OASIS simulation configuration
     OASIS_DEFAULT_MAX_ROUNDS = int(os.environ.get('OASIS_DEFAULT_MAX_ROUNDS', '10'))
     OASIS_SIMULATION_DATA_DIR = os.path.join(os.path.dirname(__file__), '../uploads/simulations')

@@ -10,6 +10,11 @@ from enum import Enum
 from typing import Dict, Any, Optional
 from dataclasses import dataclass, field
 
+from ..utils.logger import get_logger
+
+
+logger = get_logger('mirofish.task')
+
 
 class TaskStatus(str, Enum):
     """Task status enumeration"""
@@ -96,6 +101,14 @@ class TaskManager:
         with self._task_lock:
             self._tasks[task_id] = task
 
+        metadata_keys = ",".join(sorted((metadata or {}).keys())) or "-"
+        logger.info(
+            "Task created: task_id=%s task_type=%s metadata_keys=%s",
+            task_id,
+            task_type,
+            metadata_keys,
+        )
+
         return task_id
 
     def get_task(self, task_id: str) -> Optional[Task]:
@@ -127,20 +140,40 @@ class TaskManager:
         """
         with self._task_lock:
             task = self._tasks.get(task_id)
-            if task:
-                task.updated_at = datetime.now()
-                if status is not None:
-                    task.status = status
-                if progress is not None:
-                    task.progress = progress
-                if message is not None:
-                    task.message = message
-                if result is not None:
-                    task.result = result
-                if error is not None:
-                    task.error = error
-                if progress_detail is not None:
-                    task.progress_detail = progress_detail
+            if not task:
+                logger.warning(
+                    "Task update skipped: task_id=%s not found requested_status=%s progress=%s error=%s",
+                    task_id,
+                    status.value if isinstance(status, TaskStatus) else status,
+                    progress,
+                    error,
+                )
+                return
+
+            previous_status = task.status
+            task.updated_at = datetime.now()
+            if status is not None:
+                task.status = status
+            if progress is not None:
+                task.progress = progress
+            if message is not None:
+                task.message = message
+            if result is not None:
+                task.result = result
+            if error is not None:
+                task.error = error
+            if progress_detail is not None:
+                task.progress_detail = progress_detail
+
+            if status is not None and status != previous_status:
+                logger.info(
+                    "Task status changed: task_id=%s %s -> %s progress=%s message=%s",
+                    task_id,
+                    previous_status.value,
+                    status.value,
+                    task.progress,
+                    task.message or "-",
+                )
 
     def complete_task(self, task_id: str, result: Dict):
         """Mark task as completed"""
@@ -151,6 +184,8 @@ class TaskManager:
             message="Task completed",
             result=result
         )
+        result_keys = ",".join(sorted((result or {}).keys())) or "-"
+        logger.info("Task completed: task_id=%s result_keys=%s", task_id, result_keys)
 
     def fail_task(self, task_id: str, error: str):
         """Mark task as failed"""
@@ -160,6 +195,7 @@ class TaskManager:
             message="Task failed",
             error=error
         )
+        logger.error("Task failed: task_id=%s error=%s", task_id, error)
 
     def list_tasks(self, task_type: Optional[str] = None) -> list:
         """List tasks"""
@@ -181,4 +217,3 @@ class TaskManager:
             ]
             for tid in old_ids:
                 del self._tasks[tid]
-

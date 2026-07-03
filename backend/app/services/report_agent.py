@@ -56,9 +56,7 @@ class ReportLogger:
             report_id: Report ID, used to determine the log file path
         """
         self.report_id = report_id
-        self.log_file_path = os.path.join(
-            Config.UPLOAD_FOLDER, 'reports', report_id, 'agent_log.jsonl'
-        )
+        self.log_file_path = ReportManager._get_agent_log_path(report_id)
         self.start_time = datetime.now()
         self._ensure_log_file()
     
@@ -327,9 +325,7 @@ class ReportConsoleLogger:
             report_id: Report ID, used to determine the log file path
         """
         self.report_id = report_id
-        self.log_file_path = os.path.join(
-            Config.UPLOAD_FOLDER, 'reports', report_id, 'console_log.txt'
-        )
+        self.log_file_path = ReportManager._get_console_log_path(report_id)
         self._ensure_log_file()
         self._file_handler = None
         self._setup_file_handler()
@@ -2496,18 +2492,53 @@ class ReportManager:
     
     # Reportstorage directory
     REPORTS_DIR = os.path.join(Config.UPLOAD_FOLDER, 'reports')
+    FALLBACK_REPORTS_DIR = os.path.join(Config.UPLOAD_FOLDER, 'reports_local')
     QUALITY_REVIEW_THRESHOLD = 80
     PROGRESS_STALE_AFTER_SECONDS = int(os.environ.get('REPORT_PROGRESS_STALE_AFTER_SECONDS', '300'))
     
     @classmethod
     def _ensure_reports_dir(cls):
         """ensurereportroot directory exists"""
-        os.makedirs(cls.REPORTS_DIR, exist_ok=True)
+        return cls._get_reports_dir()
+
+    @classmethod
+    def _is_writable_dir(cls, directory: str) -> bool:
+        probe = os.path.join(directory, f".write_test_{os.getpid()}")
+        try:
+            with open(probe, "w", encoding="utf-8") as handle:
+                handle.write("")
+            os.remove(probe)
+            return True
+        except OSError:
+            try:
+                if os.path.exists(probe):
+                    os.remove(probe)
+            except OSError:
+                pass
+            return False
+
+    @classmethod
+    def _get_reports_dir(cls) -> str:
+        try:
+            os.makedirs(cls.REPORTS_DIR, exist_ok=True)
+            if cls._is_writable_dir(cls.REPORTS_DIR):
+                return cls.REPORTS_DIR
+            raise PermissionError(f"Report directory is not writable: {cls.REPORTS_DIR}")
+        except OSError as exc:
+            fallback_dir = getattr(cls, "FALLBACK_REPORTS_DIR", os.path.join(Config.UPLOAD_FOLDER, "reports_local"))
+            os.makedirs(fallback_dir, exist_ok=True)
+            logger.warning(
+                "Using fallback report storage directory: reports_dir=%s fallback_dir=%s error=%s",
+                cls.REPORTS_DIR,
+                fallback_dir,
+                exc,
+            )
+            return fallback_dir
     
     @classmethod
     def _get_report_folder(cls, report_id: str) -> str:
         """getreportfolderpath"""
-        return os.path.join(cls.REPORTS_DIR, report_id)
+        return os.path.join(cls._get_reports_dir(), report_id)
     
     @classmethod
     def _ensure_report_folder(cls, report_id: str) -> str:
@@ -3328,7 +3359,7 @@ class ReportManager:
         
         if not os.path.exists(path):
             # backward compatibleformat：Checkdirectlystored inreportsunder directoryfile
-            old_path = os.path.join(cls.REPORTS_DIR, f"{report_id}.json")
+            old_path = os.path.join(cls._get_reports_dir(), f"{report_id}.json")
             if os.path.exists(old_path):
                 path = old_path
             else:
@@ -3390,10 +3421,10 @@ class ReportManager:
     @classmethod
     def get_report_by_simulation(cls, simulation_id: str) -> Optional[Report]:
         """based onsimulationIDgetreport"""
-        cls._ensure_reports_dir()
+        reports_dir = cls._get_reports_dir()
         
-        for item in os.listdir(cls.REPORTS_DIR):
-            item_path = os.path.join(cls.REPORTS_DIR, item)
+        for item in os.listdir(reports_dir):
+            item_path = os.path.join(reports_dir, item)
             # newformat：filefolder
             if os.path.isdir(item_path):
                 report = cls.get_report(item)
@@ -3411,11 +3442,11 @@ class ReportManager:
     @classmethod
     def list_reports(cls, simulation_id: Optional[str] = None, limit: int = 50) -> List[Report]:
         """columnappearreport"""
-        cls._ensure_reports_dir()
+        reports_dir = cls._get_reports_dir()
         
         reports = []
-        for item in os.listdir(cls.REPORTS_DIR):
-            item_path = os.path.join(cls.REPORTS_DIR, item)
+        for item in os.listdir(reports_dir):
+            item_path = os.path.join(reports_dir, item)
             # newformat：filefolder
             if os.path.isdir(item_path):
                 report = cls.get_report(item)
@@ -3450,8 +3481,9 @@ class ReportManager:
         
         # backward compatibleformat：Deleteseparatefile
         deleted = False
-        old_json_path = os.path.join(cls.REPORTS_DIR, f"{report_id}.json")
-        old_md_path = os.path.join(cls.REPORTS_DIR, f"{report_id}.md")
+        reports_dir = cls._get_reports_dir()
+        old_json_path = os.path.join(reports_dir, f"{report_id}.json")
+        old_md_path = os.path.join(reports_dir, f"{report_id}.md")
         
         if os.path.exists(old_json_path):
             os.remove(old_json_path)

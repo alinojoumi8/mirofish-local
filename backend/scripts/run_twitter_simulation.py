@@ -52,6 +52,7 @@ from forecast_runtime import (
     due_scheduled_events,
     inject_agent_forecast_memory,
     record_actions_to_short_memory,
+    resolve_simulation_start_hour,
     select_active_agents_for_round,
 )
 
@@ -566,10 +567,11 @@ class TwitterSimulationRunner:
         # Main simulation loop
         print("\nStart simulation loop...")
         start_time = datetime.now()
-        
+        start_minutes = resolve_simulation_start_hour(self.config) * 60
+
         for round_num in range(total_rounds):
             # Calculate current simulation time
-            simulated_minutes = round_num * minutes_per_round
+            simulated_minutes = start_minutes + round_num * minutes_per_round
             simulated_hour = (simulated_minutes // 60) % 24
             simulated_day = simulated_minutes // (60 * 24) + 1
 

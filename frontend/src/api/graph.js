@@ -158,3 +158,20 @@ export function compareCaseVersions(caseId, data) {
     data
   })
 }
+
+/**
+ * Record a new document batch as a new version of an existing case (record-only;
+ * the full analyze-and-build path stays generateOntology with a case_id field).
+ */
+export function addDocumentsToCase(caseId, formData) {
+  return requestWithRetry(() =>
+    service({
+      url: `/api/graph/case/${caseId}/documents`,
+      method: 'post',
+      data: formData,
+      headers: {
+        'Content-Type': 'multipart/form-data'
+      }
+    })
+  )
+}

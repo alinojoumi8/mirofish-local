@@ -233,6 +233,7 @@ def normalize_prediction_settings(raw: Optional[Dict[str, Any]] = None) -> Dict[
             "report_depth",
             "max_rounds",
             "seed",
+            "prediction_target",
         }:
             settings[key] = value
 
@@ -378,6 +379,43 @@ class Case:
             graph_ids=data.get("graph_ids", []),
             tags=data.get("tags", []),
         )
+
+
+def build_prediction_snapshot(
+    forecast: Optional[Dict[str, Any]],
+    report_id: Optional[str] = None,
+    simulation_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Flatten a report's `forecast` dict into a diff-friendly snapshot.
+
+    Top-level keys are per-outcome probabilities plus `point_estimate`/`confidence`,
+    so `compare_prediction_versions` produces clean numeric deltas. Non-comparable
+    context lives under the reserved `_meta` key (skipped by the comparison).
+    """
+    forecast = forecast or {}
+    snapshot: Dict[str, Any] = {}
+    for row in forecast.get("probabilities") or []:
+        label = str(row.get("outcome") or "").strip()
+        if not label:
+            continue
+        try:
+            snapshot[label] = round(float(row.get("probability") or 0.0), 4)
+        except (TypeError, ValueError):
+            continue
+    numeric = forecast.get("numeric") or {}
+    if numeric.get("point_estimate") is not None:
+        snapshot["point_estimate"] = numeric.get("point_estimate")
+    if forecast.get("confidence"):
+        snapshot["confidence"] = forecast.get("confidence")
+    snapshot["_meta"] = {
+        "report_id": report_id,
+        "simulation_id": simulation_id,
+        "forecast_mode": forecast.get("forecast_mode"),
+        "forecast_horizon": forecast.get("forecast_horizon"),
+        "created_at": _now(),
+        "probabilities": forecast.get("probabilities") or [],
+    }
+    return snapshot
 
 
 class CaseManager:
@@ -535,6 +573,37 @@ class CaseManager:
         return None
 
     @classmethod
+    def record_prediction_snapshot(
+        cls,
+        case_id: str,
+        version_id: str,
+        snapshot: Dict[str, Any],
+        report_id: Optional[str] = None,
+        simulation_id: Optional[str] = None,
+    ) -> Optional[CaseVersion]:
+        """Append a prediction snapshot to a case version (unlike update_version,
+        which replaces attributes) and link the report/simulation that produced it."""
+        case = cls.get_case(case_id)
+        if not case:
+            return None
+        target = None
+        for version in case.versions:
+            if version.version_id == version_id:
+                target = version
+                break
+        if not target:
+            return None
+
+        target.prediction_snapshots.append(snapshot)
+        if report_id and report_id not in target.report_ids:
+            target.report_ids.append(report_id)
+        if simulation_id and simulation_id not in target.simulation_ids:
+            target.simulation_ids.append(simulation_id)
+        target.status = "reported"
+        cls.save_case(case)
+        return target
+
+    @classmethod
     def compare_prediction_versions(cls, case_id: str, from_version_id: str, to_version_id: str) -> Dict[str, Any]:
         from_version = cls.get_version(case_id, from_version_id)
         to_version = cls.get_version(case_id, to_version_id)
@@ -545,6 +614,8 @@ class CaseManager:
         to_snapshot = to_version.prediction_snapshots[-1] if to_version.prediction_snapshots else {}
         changed: Dict[str, Dict[str, Any]] = {}
         for key in sorted(set(from_snapshot) | set(to_snapshot)):
+            if key.startswith("_"):
+                continue
             old = from_snapshot.get(key)
             new = to_snapshot.get(key)
             if old == new:

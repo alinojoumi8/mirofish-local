@@ -800,6 +800,110 @@ def get_prepare_status():
         }), 500
 
 
+@simulation_bp.route('/run-ensemble', methods=['POST'])
+def run_ensemble():
+    """
+    Run the prepared simulation multiple times with different seeds and aggregate the
+    grounded forecast signal into a calibrated distribution (saved to ensemble_signal.json,
+    which the report's forecast then prefers over a single run).
+
+    Request (JSON):
+        {
+            "simulation_id": "sim_xxxx",          // Required
+            "runs": 3,                             // Optional (default: config ensemble_runs)
+            "max_rounds": 12,                      // Optional
+            "enable_graph_memory_update": true     // Optional (default true)
+        }
+    """
+    import threading
+    from ..models.task import TaskManager
+    from ..services.ensemble_runner import EnsembleRunner
+
+    try:
+        data = request.get_json() or {}
+        simulation_id = data.get('simulation_id')
+        if not simulation_id:
+            return jsonify({"success": False, "error": "Please provide simulation_id"}), 400
+
+        is_prepared, _ = _check_simulation_prepared(simulation_id)
+        if not is_prepared:
+            return jsonify({"success": False, "error": "Simulation not ready. Please call /prepare first"}), 400
+
+        runs = data.get('runs')
+        max_rounds = data.get('max_rounds')
+        storage = None
+        if data.get('enable_graph_memory_update', True):
+            storage = current_app.extensions.get('neo4j_storage')
+
+        task_manager = TaskManager()
+        task_id = task_manager.create_task('ensemble_run', metadata={'simulation_id': simulation_id})
+
+        def run_ensemble_task():
+            from ..models.task import TaskStatus
+            try:
+                def progress(done, total, signal):
+                    task_manager.update_task(
+                        task_id,
+                        status=TaskStatus.PROCESSING,
+                        progress=int(done / max(total, 1) * 100),
+                        message=f"Ensemble run {done}/{total} complete",
+                    )
+                aggregate = EnsembleRunner.run_ensemble(
+                    simulation_id,
+                    runs=runs,
+                    max_rounds=max_rounds,
+                    storage=storage,
+                    progress_callback=progress,
+                )
+                task_manager.complete_task(task_id, {"simulation_id": simulation_id, "ensemble": aggregate})
+            except Exception as exc:
+                logger.error(f"Ensemble run failed: {exc}")
+                task_manager.fail_task(task_id, str(exc))
+
+        threading.Thread(target=run_ensemble_task, daemon=True).start()
+
+        return jsonify({
+            "success": True,
+            "data": {
+                "simulation_id": simulation_id,
+                "task_id": task_id,
+                "runs": runs,
+                "message": "Ensemble started. Poll progress via /api/simulation/run-ensemble/status",
+            }
+        })
+    except Exception as e:
+        logger.error(f"Failed to start ensemble: {str(e)}")
+        return jsonify({"success": False, "error": str(e), "traceback": traceback.format_exc()}), 500
+
+
+@simulation_bp.route('/run-ensemble/status', methods=['POST'])
+def get_ensemble_status():
+    """Query ensemble progress by task_id, or read the latest persisted ensemble_signal
+    by simulation_id."""
+    from ..models.task import TaskManager
+    try:
+        data = request.get_json() or {}
+        task_id = data.get('task_id')
+        simulation_id = data.get('simulation_id')
+
+        if task_id:
+            task = TaskManager().get_task(task_id)
+            if not task:
+                return jsonify({"success": False, "error": f"Task does not exist: {task_id}"}), 404
+            return jsonify({"success": True, "data": task.to_dict()})
+
+        if simulation_id:
+            path = os.path.join(Config.OASIS_SIMULATION_DATA_DIR, simulation_id, "ensemble_signal.json")
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as handle:
+                    return jsonify({"success": True, "data": {"status": "completed", "ensemble": json.load(handle)}})
+            return jsonify({"success": True, "data": {"status": "not_started"}})
+
+        return jsonify({"success": False, "error": "Please provide task_id or simulation_id"}), 400
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
 @simulation_bp.route('/<simulation_id>', methods=['GET'])
 def get_simulation(simulation_id: str):
     """Get simulation status"""

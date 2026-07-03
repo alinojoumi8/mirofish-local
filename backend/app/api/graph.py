@@ -17,6 +17,7 @@ from ..services.embedding_benchmark import DEFAULT_QUERIES, run_embedding_benchm
 from ..services.text_processor import TextProcessor
 from ..storage.extraction_cache import ExtractionCache
 from ..utils.file_parser import FileParser
+from ..utils.url_fetcher import fetch_url, parse_urls
 from ..utils.logger import get_logger
 from ..utils.timing import PhaseTimer
 from ..models.task import TaskManager, TaskStatus
@@ -354,12 +355,14 @@ def generate_ontology():
                 "error": "Please provide simulation requirement description (simulation_requirement)"
             }), 400
 
-        # Get uploaded files
+        # Get uploaded files and/or website URLs
         uploaded_files = request.files.getlist('files')
-        if not uploaded_files or all(not f.filename for f in uploaded_files):
+        has_files = bool(uploaded_files) and any(f.filename for f in uploaded_files)
+        source_urls = parse_urls(request.form.getlist('urls') or request.form.get('urls', ''))
+        if not has_files and not source_urls:
             return jsonify({
                 "success": False,
-                "error": "Please upload at least one document file"
+                "error": "Please upload at least one document file or provide a website URL"
             }), 400
 
         # Create or load case
@@ -387,7 +390,8 @@ def generate_ontology():
         document_payloads = []
         all_text = ""
 
-        with timing.time("document_extraction", label="Save files and extract text", metadata={"file_count": len(uploaded_files)}):
+        url_errors = []
+        with timing.time("document_extraction", label="Save files and extract text", metadata={"file_count": len(uploaded_files), "url_count": len(source_urls)}):
             for file in uploaded_files:
                 if file and file.filename and allowed_file(file.filename):
                     # Save file to project directory
@@ -409,13 +413,43 @@ def generate_ontology():
                         "document_type": document_type,
                     })
                     all_text += f"\n\n=== {file_info['original_filename']} ===\n{text}"
+
+            # Fetch and extract text from website URLs (treated as documents)
+            for url in source_urls:
+                try:
+                    fetched = fetch_url(url)
+                except Exception as exc:
+                    logger.warning(f"Failed to fetch URL {url}: {exc}")
+                    url_errors.append({"url": url, "error": str(exc)})
+                    continue
+                text = TextProcessor.preprocess_text(fetched["text"])
+                if not text.strip():
+                    url_errors.append({"url": url, "error": "No readable text extracted"})
+                    continue
+                display_name = f"{fetched['title']} ({fetched['url']})"
+                document_type = classify_document_type(fetched["title"], text).value
+                ontology_texts.append(text)
+                document_payloads.append({
+                    "filename": display_name,
+                    "path": fetched["url"],
+                    "size": len(text),
+                    "text": text,
+                    "document_type": document_type,
+                    "source_url": fetched["url"],
+                })
+                all_text += f"\n\n=== {display_name} ===\n{text}"
         phase_profile["pdf_extraction_seconds"] = timing.snapshot()["phase_totals"].get("document_extraction", 0.0)
+        phase_profile["url_count"] = len(source_urls)
+        phase_profile["url_errors"] = url_errors
 
         if not ontology_texts:
             ProjectManager.delete_project(project.project_id)
+            detail = ""
+            if url_errors:
+                detail = " URL errors: " + "; ".join(f"{e['url']}: {e['error']}" for e in url_errors)
             return jsonify({
                 "success": False,
-                "error": "No documents successfully processed. Please check file format"
+                "error": "No documents successfully processed. Please check file format or URL." + detail
             }), 400
 
         with timing.time("case_version", label="Create case version", metadata={"document_count": len(document_payloads)}):

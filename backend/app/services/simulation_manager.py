@@ -406,7 +406,6 @@ class SimulationManager:
                 storage=storage,
                 graph_id=state.graph_id,
                 forecast_settings=forecast_settings.to_dict(),
-                prediction_settings=state.prediction_settings,
             )
             
             def profile_progress(current, total, msg):

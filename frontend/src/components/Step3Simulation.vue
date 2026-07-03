@@ -104,16 +104,53 @@
             </span>
           </div>
         </div>
+
+        <!-- Ensemble (multi-seed) run progress -->
+        <div v-if="ensemble.active || ensemble.done" class="platform-status ensemble-card" :class="{ active: ensemble.active, completed: ensemble.done }">
+          <div class="platform-header">
+            <span class="platform-name">Ensemble</span>
+            <span v-if="ensemble.done" class="status-badge">
+              <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="3">
+                <polyline points="20 6 9 17 4 12"></polyline>
+              </svg>
+            </span>
+          </div>
+          <div class="platform-stats">
+            <span class="stat">
+              <span class="stat-label">RUNS</span>
+              <span class="stat-value mono">{{ ensemble.result ? `${ensemble.result.completed_runs}/${ensemble.result.runs}` : ensembleRuns }}</span>
+            </span>
+            <span class="stat">
+              <span class="stat-label">NET</span>
+              <span class="stat-value mono">{{ ensemble.result ? formatSigned(ensemble.result.mean_net) : `${ensemble.progress}%` }}</span>
+            </span>
+          </div>
+          <div class="ensemble-progress-track">
+            <div class="ensemble-progress-fill" :style="{ width: ensemble.progress + '%' }"></div>
+          </div>
+        </div>
       </div>
 
       <div class="action-controls">
-        <button 
+        <button
+          v-if="canRunEnsemble"
+          class="action-btn ensemble"
+          :disabled="ensemble.active || isGeneratingReport"
+          :title="`Re-run the simulation ${ensembleRuns} times with different seeds and aggregate the grounded forecast into a confidence-bearing distribution`"
+          @click="doRunEnsemble"
+        >
+          <span v-if="ensemble.active" class="loading-spinner-small"></span>
+          <span v-if="ensemble.active">Ensemble {{ ensemble.progress }}%</span>
+          <span v-else-if="ensemble.done">Re-run ensemble</span>
+          <span v-else>Run {{ ensembleRuns }}-seed ensemble</span>
+        </button>
+        <button
           class="action-btn primary"
           :disabled="phase !== 2 || isGeneratingReport"
           @click="handleNextStep"
         >
           <span v-if="isGeneratingReport" class="loading-spinner-small"></span>
-          {{ isGeneratingReport ? 'Starting...' : 'Start Generating Report' }} 
+          {{ isGeneratingReport ? 'Starting...' : 'Start Generating Report' }}
           <span v-if="!isGeneratingReport" class="arrow-icon">→</span>
         </button>
       </div>
@@ -288,7 +325,10 @@
     <div v-if="diagnostics" class="diagnostics-panel">
       <div class="diagnostics-header">
         <span class="diagnostics-title">Agent Diagnostics</span>
-        <span class="diagnostics-badge">{{ diagnostics.quality_report?.recommended_next_run || 'none' }}</span>
+        <div class="diagnostics-header-right">
+          <span class="diagnostics-badge">{{ diagnostics.quality_report?.recommended_next_run || 'none' }}</span>
+          <button class="diagnostics-export-btn" title="Download full diagnostics as JSON" @click="exportDiagnostics">Export JSON</button>
+        </div>
       </div>
       <div class="diagnostics-grid">
         <div class="diagnostic-metric">
@@ -326,6 +366,15 @@
           <div v-if="!(diagnostics.off_track_agents || []).length" class="list-empty">No off-track agents flagged</div>
         </div>
       </div>
+      <div v-if="topicRows.length" class="diagnostics-topics">
+        <span class="list-title">Topic coverage</span>
+        <div class="topic-chips">
+          <span v-for="t in topicRows" :key="t.topic" class="topic-chip">
+            {{ t.topic }}
+            <span class="topic-chip-count mono">{{ t.actions }}</span>
+          </span>
+        </div>
+      </div>
     </div>
 
     <!-- Bottom Info / Logs -->
@@ -347,12 +396,15 @@
 <script setup>
 import { ref, computed, watch, onMounted, onUnmounted, nextTick } from 'vue'
 import { useRouter } from 'vue-router'
-import { 
-  startSimulation, 
+import {
+  startSimulation,
   stopSimulation,
-  getRunStatus, 
+  getRunStatus,
   getRunStatusDetail,
-  getRunDiagnostics
+  getRunDiagnostics,
+  runEnsemble,
+  getEnsembleStatus,
+  getDiagnosticsExportUrl
 } from '../api/simulation'
 import { generateReport } from '../api/report'
 
@@ -365,7 +417,20 @@ const props = defineProps({
   },
   projectData: Object,
   graphData: Object,
-  systemLogs: Array
+  systemLogs: Array,
+  // 'realistic' (default): agents get per-round forecast/stance grounding and the
+  // graph is updated live. 'fast': cheap preview with grounding disabled.
+  runtimeMode: {
+    type: String,
+    default: 'realistic'
+  },
+  // Number of seeded ensemble runs configured in Step 2. When > 1, the user can run a
+  // multi-seed ensemble that aggregates the grounded forecast across runs (stronger,
+  // confidence-bearing forecast) instead of relying on a single stochastic run.
+  ensembleRuns: {
+    type: Number,
+    default: 1
+  }
 })
 
 const emit = defineEmits(['go-back', 'next-step', 'add-log', 'update-status'])
@@ -383,6 +448,16 @@ const diagnostics = ref(null)
 const allActions = ref([]) // All actions (incremental accumulation)
 const actionIds = ref(new Set()) // Action IDs set for deduplication
 const scrollContainer = ref(null)
+
+// Ensemble (multi-seed) run state
+const ensemble = ref({
+  active: false,      // an ensemble run is in progress
+  done: false,        // an ensemble run has completed for this simulation
+  taskId: null,
+  progress: 0,        // 0-100
+  message: '',        // latest status message ("Ensemble run 2/5 complete")
+  result: null        // aggregated ensemble_signal on completion
+})
 
 // Computed
 // Display actions in chronological order (newest at the bottom)
@@ -432,6 +507,29 @@ const redditElapsedTime = computed(() => {
   return formatElapsedTime(runStatus.value.reddit_current_round || 0)
 })
 
+// The ensemble run re-runs the simulation with multiple seeds and grounds the forecast
+// on the aggregate. Only offered in realistic mode (fast mode disables the per-round
+// grounding the ensemble depends on) and when Step 2 configured more than one run.
+const canRunEnsemble = computed(() => props.ensembleRuns > 1 && props.runtimeMode !== 'fast')
+
+// Topic coverage derived from the diagnostics payload already fetched (topics is a dict
+// keyed by topic name → { actions_count, agents[], rounds[], platforms{} }).
+const topicRows = computed(() => {
+  const topics = diagnostics.value?.topics || {}
+  return Object.entries(topics)
+    .map(([topic, row]) => ({
+      topic,
+      actions: row.actions_count || 0,
+      agents: (row.agents || []).length
+    }))
+    .sort((a, b) => b.actions - a.actions)
+})
+
+const exportDiagnostics = () => {
+  if (!props.simulationId) return
+  window.open(getDiagnosticsExportUrl(props.simulationId), '_blank')
+}
+
 // Methods
 const addLog = (msg) => {
   emit('add-log', msg)
@@ -450,6 +548,8 @@ const resetAllState = () => {
   isStarting.value = false
   isStopping.value = false
   stopPolling()  // Stop any existing polling
+  stopEnsemblePolling()
+  ensemble.value = { active: false, done: false, taskId: null, progress: 0, message: '', result: null }
 }
 
 // Start simulation
@@ -468,14 +568,17 @@ const doStartSimulation = async () => {
   emit('update-status', 'processing')
 
   try {
+    const realistic = props.runtimeMode !== 'fast'
     const params = {
       simulation_id: props.simulationId,
       platform: 'parallel',
       force: true,  // Force restart
-      enable_graph_memory_update: false,  // Faster run: skip live graph memory writes
+      // Realistic mode grounds agents each round (forecast target + their graph-derived
+      // stance) and writes activity back to the graph; fast mode skips both for speed.
+      enable_graph_memory_update: realistic,
       scenario_id: 'baseline',
       seed: Date.now() % 1000000,
-      memory_mode: 'off'
+      memory_mode: realistic ? 'practical' : 'off'
     }
 
     if (props.maxRounds) {
@@ -483,7 +586,9 @@ const doStartSimulation = async () => {
       addLog(`Set max simulation rounds: ${props.maxRounds}`)
     }
 
-    addLog('Fast runtime mode enabled: forecast memory and live graph updates disabled')
+    addLog(realistic
+      ? 'Realistic runtime mode: per-round forecast/stance grounding and live graph updates enabled'
+      : 'Fast preview mode: forecast memory and live graph updates disabled')
 
     const res = await startSimulation(params)
 
@@ -537,6 +642,120 @@ const handleStopSimulation = async () => {
   } finally {
     isStopping.value = false
   }
+}
+
+// --- Ensemble (multi-seed) run ---
+let ensembleTimer = null
+
+const stopEnsemblePolling = () => {
+  if (ensembleTimer) {
+    clearInterval(ensembleTimer)
+    ensembleTimer = null
+  }
+}
+
+// Run the simulation N times with different seeds and aggregate the grounded forecast.
+// This replaces the single stochastic run as the forecast basis: the backend persists
+// ensemble_signal.json, which the report's forecast prefers over any single run.
+const doRunEnsemble = async () => {
+  if (!props.simulationId || ensemble.value.active) return
+
+  // Stop the in-progress single run + its polling so the ensemble can restart cleanly.
+  stopPolling()
+  if (phase.value !== 2) {
+    try {
+      await stopSimulation({ simulation_id: props.simulationId })
+    } catch (err) {
+      // Best effort — the ensemble runner also resets the environment before each run.
+      console.warn('Pre-ensemble stop failed (continuing):', err)
+    }
+  }
+
+  ensemble.value = {
+    active: true,
+    done: false,
+    taskId: null,
+    progress: 0,
+    message: `Starting ${props.ensembleRuns}-seed ensemble…`,
+    result: null
+  }
+  phase.value = 1
+  emit('update-status', 'processing')
+  addLog(`Starting ${props.ensembleRuns}-seed ensemble (each seed re-runs the simulation and grounds the forecast)…`)
+
+  try {
+    const res = await runEnsemble({
+      simulation_id: props.simulationId,
+      runs: props.ensembleRuns,
+      enable_graph_memory_update: props.runtimeMode !== 'fast'
+    })
+
+    if (res.success && res.data?.task_id) {
+      ensemble.value.taskId = res.data.task_id
+      addLog(`✓ Ensemble started (task ${res.data.task_id})`)
+      startEnsemblePolling()
+    } else {
+      throw new Error(res.error || 'Failed to start ensemble')
+    }
+  } catch (err) {
+    ensemble.value.active = false
+    ensemble.value.message = `Ensemble failed: ${err.message}`
+    addLog(`✗ Ensemble failed to start: ${err.message}`)
+    emit('update-status', 'error')
+  }
+}
+
+const startEnsemblePolling = () => {
+  stopEnsemblePolling()
+  ensembleTimer = setInterval(fetchEnsembleStatus, 4000)
+}
+
+const fetchEnsembleStatus = async () => {
+  if (!ensemble.value.taskId) return
+
+  try {
+    const res = await getEnsembleStatus({ task_id: ensemble.value.taskId })
+    if (!res.success || !res.data) return
+
+    const task = res.data
+    ensemble.value.progress = task.progress || 0
+    if (task.message) ensemble.value.message = task.message
+
+    if (task.status === 'completed') {
+      stopEnsemblePolling()
+      ensemble.value.active = false
+      ensemble.value.done = true
+      ensemble.value.result = task.result?.ensemble || null
+      phase.value = 2
+
+      const agg = ensemble.value.result
+      if (agg) {
+        addLog(
+          `✓ Ensemble complete: ${agg.completed_runs}/${agg.runs} runs, ` +
+          `net sentiment ${formatSigned(agg.mean_net)} ± ${(agg.std_net ?? 0)}, ` +
+          `${agg.total_actions || 0} total actions`
+        )
+      } else {
+        addLog('✓ Ensemble complete')
+      }
+      addLog('Forecast will now be grounded on the aggregated ensemble signal.')
+      emit('update-status', 'completed')
+      loadDiagnostics()
+    } else if (task.status === 'failed') {
+      stopEnsemblePolling()
+      ensemble.value.active = false
+      ensemble.value.message = `Ensemble failed: ${task.error || 'Unknown error'}`
+      addLog(`✗ Ensemble failed: ${task.error || 'Unknown error'}`)
+      emit('update-status', 'error')
+    }
+  } catch (err) {
+    console.warn('Failed to fetch ensemble status:', err)
+  }
+}
+
+const formatSigned = (value) => {
+  const n = Number(value || 0)
+  return `${n >= 0 ? '+' : ''}${n.toFixed(2)}`
 }
 
 // Polling status
@@ -792,6 +1011,7 @@ onMounted(() => {
 
 onUnmounted(() => {
   stopPolling()
+  stopEnsemblePolling()
 })
 </script>
 
@@ -997,6 +1217,45 @@ onUnmounted(() => {
   cursor: not-allowed;
 }
 
+.action-controls {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.action-btn.ensemble {
+  background: #FFF;
+  color: #1A936F;
+  border: 1px solid #1A936F;
+}
+
+.action-btn.ensemble:hover:not(:disabled) {
+  background: #F2FAF6;
+}
+
+/* Ensemble progress card */
+.ensemble-card.active {
+  opacity: 1;
+  border-color: #1A936F;
+  background: #F2FAF6;
+}
+
+.ensemble-progress-track {
+  margin-top: 6px;
+  width: 100%;
+  height: 4px;
+  border-radius: 2px;
+  background: #E4EFE9;
+  overflow: hidden;
+}
+
+.ensemble-progress-fill {
+  height: 100%;
+  background: #1A936F;
+  border-radius: 2px;
+  transition: width 0.4s ease;
+}
+
 /* --- Main Content Area --- */
 .main-content-area {
   flex: 1;
@@ -1034,6 +1293,52 @@ onUnmounted(() => {
   border-radius: 4px;
   padding: 3px 8px;
   text-transform: uppercase;
+}
+
+.diagnostics-header-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.diagnostics-export-btn {
+  font-size: 10px;
+  font-weight: 700;
+  color: #374151;
+  background: #FFF;
+  border: 1px solid #D1D5DB;
+  border-radius: 4px;
+  padding: 3px 8px;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+.diagnostics-export-btn:hover { background: #F3F4F6; }
+
+.diagnostics-topics {
+  margin-top: 8px;
+  border: 1px solid #E5E7EB;
+  border-radius: 4px;
+  padding: 8px;
+}
+.topic-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.topic-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  font-weight: 600;
+  color: #374151;
+  background: #F9FAFB;
+  border: 1px solid #E5E7EB;
+  border-radius: 999px;
+  padding: 2px 8px;
+  text-transform: capitalize;
+}
+.topic-chip-count {
+  font-size: 10px;
+  font-weight: 800;
+  color: #047857;
 }
 
 .diagnostics-grid {

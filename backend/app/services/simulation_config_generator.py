@@ -21,6 +21,7 @@ from openai import OpenAI
 from ..config import Config
 from ..utils.logger import get_logger
 from .entity_reader import EntityNode
+from .stance import infer_stance
 from .forecasting import (
     DEFAULT_HORIZONS,
     DEFAULT_OUTCOMES,
@@ -81,6 +82,9 @@ class AgentActivityConfig:
 
     # Stance (attitude toward specific topics)
     stance: str = "neutral"  # supportive, opposing, neutral, observer
+
+    # Short evidence string explaining why this stance was assigned (from graph edges)
+    stance_rationale: str = ""
 
     # Influence weight (determines probability of their speech being seen by other agents)
     influence_weight: float = 1.0
@@ -1049,6 +1053,15 @@ Return JSON format (no markdown):
             if not cfg:
                 cfg = self._generate_agent_config_by_rule(entity, forecast_settings)
 
+            # Authoritative stance derived from the entity's SUPPORTS/OPPOSES edges in
+            # the graph. This overrides the generic/neutral defaults so agents act in
+            # character and the forecast can be grounded in their real positions.
+            prediction_target = (forecast_settings or {}).get("prediction_target")
+            stance_info = infer_stance(entity, prediction_target)
+            if stance_info["stance"] != "neutral":
+                cfg["stance"] = stance_info["stance"]
+                cfg["sentiment_bias"] = stance_info["sentiment_bias"]
+
             config = AgentActivityConfig(
                 agent_id=agent_id,
                 entity_uuid=entity.uuid,
@@ -1062,6 +1075,7 @@ Return JSON format (no markdown):
                 response_delay_max=cfg.get("response_delay_max", 60),
                 sentiment_bias=cfg.get("sentiment_bias", 0.0),
                 stance=cfg.get("stance", "neutral"),
+                stance_rationale=stance_info.get("rationale", ""),
                 influence_weight=cfg.get("influence_weight", 1.0)
             )
             configs.append(config)
@@ -1084,12 +1098,22 @@ Return JSON format (no markdown):
                 return {"activity_level": 0.35, "posts_per_hour": 0.15, "comments_per_hour": 0.35, "active_hours": list(range(9, 18)), "response_delay_min": 60, "response_delay_max": 240, "sentiment_bias": 0.0, "stance": "evidence_weighted", "influence_weight": 1.8}
 
         if mode == "market_economy":
-            if any(term in entity_type for term in ["bank", "central", "regulator", "government"]):
+            if any(term in entity_type for term in ["centralbank", "central", "fed", "policymaker", "treasury"]):
+                return {"activity_level": 0.2, "posts_per_hour": 0.08, "comments_per_hour": 0.03, "active_hours": list(range(8, 17)), "response_delay_min": 120, "response_delay_max": 480, "sentiment_bias": 0.0, "stance": "policy_setter", "influence_weight": 3.5}
+            if any(term in entity_type for term in ["bank", "regulator", "government"]):
                 return {"activity_level": 0.25, "posts_per_hour": 0.1, "comments_per_hour": 0.05, "active_hours": list(range(8, 18)), "response_delay_min": 60, "response_delay_max": 240, "sentiment_bias": 0.0, "stance": "policy_guarded", "influence_weight": 3.0}
-            if any(term in entity_type for term in ["analyst", "media", "journalist"]):
+            if any(term in entity_type for term in ["analyst", "media", "journalist", "economist"]):
                 return {"activity_level": 0.65, "posts_per_hour": 0.6, "comments_per_hour": 0.8, "active_hours": list(range(6, 23)), "response_delay_min": 5, "response_delay_max": 45, "sentiment_bias": 0.0, "stance": "signal_interpreter", "influence_weight": 2.2}
-            if any(term in entity_type for term in ["investor", "trader", "fund"]):
+            if any(term in entity_type for term in ["institution", "fund", "assetmanager", "hedge"]):
+                return {"activity_level": 0.7, "posts_per_hour": 0.4, "comments_per_hour": 0.9, "active_hours": list(range(7, 21)), "response_delay_min": 5, "response_delay_max": 60, "sentiment_bias": 0.0, "stance": "position_taker", "influence_weight": 2.0}
+            if any(term in entity_type for term in ["dealer", "marketmaker", "hedger"]):
+                return {"activity_level": 0.6, "posts_per_hour": 0.3, "comments_per_hour": 0.7, "active_hours": list(range(7, 21)), "response_delay_min": 1, "response_delay_max": 15, "sentiment_bias": 0.0, "stance": "liquidity_provider", "influence_weight": 1.6}
+            if any(term in entity_type for term in ["investor", "trader"]):
                 return {"activity_level": 0.8, "posts_per_hour": 0.5, "comments_per_hour": 1.2, "active_hours": list(range(7, 22)), "response_delay_min": 1, "response_delay_max": 20, "sentiment_bias": 0.0, "stance": "risk_adjusting", "influence_weight": 1.7}
+            if any(term in entity_type for term in ["company", "firm", "issuer", "corporate", "corporation"]):
+                return {"activity_level": 0.4, "posts_per_hour": 0.2, "comments_per_hour": 0.3, "active_hours": list(range(8, 19)), "response_delay_min": 30, "response_delay_max": 180, "sentiment_bias": 0.0, "stance": "fundamentals_driven", "influence_weight": 1.8}
+            if any(term in entity_type for term in ["consumer", "household", "customer", "demand"]):
+                return {"activity_level": 0.5, "posts_per_hour": 0.3, "comments_per_hour": 0.9, "active_hours": list(range(17, 23)) + list(range(7, 9)), "response_delay_min": 10, "response_delay_max": 120, "sentiment_bias": 0.0, "stance": "demand_signal", "influence_weight": 0.9}
 
         if entity_type in ["university", "governmentagency", "ngo"]:
             # Official institutions: work hour activity, low frequency, high influence
