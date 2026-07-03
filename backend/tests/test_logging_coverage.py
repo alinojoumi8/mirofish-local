@@ -3,6 +3,7 @@ import logging
 import pytest
 
 from app import create_app
+from app.models.case import CaseManager
 from app.models.task import TaskManager, TaskStatus
 
 
@@ -182,5 +183,153 @@ def test_task_manager_logs_task_failures(capture_named_logger):
         record.levelno == logging.ERROR
         and f"Task failed: task_id={task_id}" in record.getMessage()
         and "error=profile generation crashed" in record.getMessage()
+        for record in records
+    )
+
+
+def test_case_snapshot_warns_when_case_missing(capture_named_logger, tmp_path, monkeypatch):
+    monkeypatch.setattr(CaseManager, "CASES_DIR", str(tmp_path / "cases"))
+    records = capture_named_logger("mirofish.case")
+
+    result = CaseManager.record_prediction_snapshot("case_missing", "ver_x", {"Win": 0.5})
+
+    assert result is None
+    assert any(
+        record.levelno == logging.WARNING
+        and "record_prediction_snapshot skipped: case not found" in record.getMessage()
+        and "case_id=case_missing" in record.getMessage()
+        for record in records
+    )
+
+
+def test_case_snapshot_warns_when_version_missing(capture_named_logger, tmp_path, monkeypatch):
+    monkeypatch.setattr(CaseManager, "CASES_DIR", str(tmp_path / "cases"))
+    records = capture_named_logger("mirofish.case")
+    case = CaseManager.create_case(name="Doe v Roe")
+
+    result = CaseManager.record_prediction_snapshot(case.case_id, "ver_missing", {"Win": 0.5})
+
+    assert result is None
+    assert any(
+        record.levelno == logging.WARNING
+        and "record_prediction_snapshot skipped: version not found" in record.getMessage()
+        and "ver_missing" in record.getMessage()
+        for record in records
+    )
+
+
+def test_case_snapshot_logs_success(capture_named_logger, tmp_path, monkeypatch):
+    monkeypatch.setattr(CaseManager, "CASES_DIR", str(tmp_path / "cases"))
+    records = capture_named_logger("mirofish.case")
+    case = CaseManager.create_case(name="Doe v Roe")
+    version = CaseManager.create_version(case.case_id, project_id="proj_1")
+
+    result = CaseManager.record_prediction_snapshot(
+        case.case_id, version.version_id, {"Win": 0.5, "_meta": {"report_id": "rep_1"}}, report_id="rep_1",
+    )
+
+    assert result is not None
+    assert any(
+        record.levelno == logging.INFO
+        and "Recorded prediction snapshot" in record.getMessage()
+        and "outcomes=1" in record.getMessage()  # _meta excluded from the count
+        for record in records
+    )
+
+
+def test_update_version_warns_when_case_missing(capture_named_logger, tmp_path, monkeypatch):
+    monkeypatch.setattr(CaseManager, "CASES_DIR", str(tmp_path / "cases"))
+    records = capture_named_logger("mirofish.case")
+
+    result = CaseManager.update_version("case_missing", "ver_x", status="built")
+
+    assert result is None
+    assert any(
+        record.levelno == logging.WARNING
+        and "update_version skipped: case not found" in record.getMessage()
+        and "fields=status" in record.getMessage()
+        for record in records
+    )
+
+
+def test_update_version_warns_when_version_missing(capture_named_logger, tmp_path, monkeypatch):
+    monkeypatch.setattr(CaseManager, "CASES_DIR", str(tmp_path / "cases"))
+    records = capture_named_logger("mirofish.case")
+    case = CaseManager.create_case(name="Doe v Roe")
+
+    result = CaseManager.update_version(case.case_id, "ver_missing", graph_id="g1")
+
+    assert result is None
+    assert any(
+        record.levelno == logging.WARNING
+        and "update_version skipped: version not found" in record.getMessage()
+        for record in records
+    )
+
+
+def test_update_version_warns_on_unknown_field(capture_named_logger, tmp_path, monkeypatch):
+    monkeypatch.setattr(CaseManager, "CASES_DIR", str(tmp_path / "cases"))
+    records = capture_named_logger("mirofish.case")
+    case = CaseManager.create_case(name="Doe v Roe")
+    version = CaseManager.create_version(case.case_id, project_id="proj_1")
+
+    CaseManager.update_version(case.case_id, version.version_id, not_a_real_field="x")
+
+    assert any(
+        record.levelno == logging.WARNING
+        and "update_version ignoring unknown field" in record.getMessage()
+        and "field=not_a_real_field" in record.getMessage()
+        for record in records
+    )
+
+
+def test_numeric_forecast_warns_when_market_enrichment_fails(capture_named_logger, monkeypatch):
+    import app.utils.market_data as market_data
+    from app.services.forecasting import ForecastSynthesizer
+
+    records = capture_named_logger("mirofish.forecast")
+    monkeypatch.setattr(market_data, "is_enabled", lambda: True)
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("network down")
+
+    monkeypatch.setattr(market_data, "resolve_target", _boom)
+
+    synth = ForecastSynthesizer("sim_test", simulation_config={"forecast_mode": "market_economy"})
+    target = {
+        "kind": "price",
+        "symbol": "^GSPC",
+        "bands": [
+            {"label": "Down", "lo": None, "hi": 0.0},
+            {"label": "Up", "lo": 0.0, "hi": None},
+        ],
+    }
+
+    result = synth._numeric_forecast(target, 0.1)
+
+    assert result is not None  # degrades gracefully rather than crashing
+    assert any(
+        record.levelno == logging.WARNING
+        and "Market-data enrichment failed" in record.getMessage()
+        and "^GSPC" in record.getMessage()
+        for record in records
+    )
+
+
+def test_file_parser_warns_when_document_extraction_fails(capture_named_logger, tmp_path):
+    from app.utils.file_parser import FileParser
+
+    records = capture_named_logger("mirofish.file_parser")
+    missing = str(tmp_path / "does_not_exist.pdf")
+
+    merged = FileParser.extract_from_multiple([missing])
+
+    # Degrades gracefully: a placeholder still appears in the merged text...
+    assert "extraction failed" in merged
+    # ...but the failure is now also visible in the logs.
+    assert any(
+        record.levelno == logging.WARNING
+        and "Failed to extract text from document" in record.getMessage()
+        and "does_not_exist.pdf" in record.getMessage()
         for record in records
     )

@@ -17,6 +17,9 @@ from enum import Enum
 from typing import Any, Dict, List, Optional
 
 from ..config import Config
+from ..utils.logger import get_logger
+
+logger = get_logger("mirofish.case")
 
 
 class DocumentType(str, Enum):
@@ -544,6 +547,10 @@ class CaseManager:
     def update_version(cls, case_id: str, version_id: str, **updates: Any) -> Optional[CaseVersion]:
         case = cls.get_case(case_id)
         if not case:
+            logger.warning(
+                "update_version skipped: case not found case_id=%s version_id=%s fields=%s",
+                case_id, version_id, ",".join(sorted(updates)) or "-",
+            )
             return None
         target = None
         for version in case.versions:
@@ -551,15 +558,29 @@ class CaseManager:
                 target = version
                 break
         if not target:
+            logger.warning(
+                "update_version skipped: version not found case_id=%s version_id=%s fields=%s",
+                case_id, version_id, ",".join(sorted(updates)) or "-",
+            )
             return None
 
+        applied = []
         for key, value in updates.items():
             if not hasattr(target, key):
+                logger.warning(
+                    "update_version ignoring unknown field: case_id=%s version_id=%s field=%s",
+                    case_id, version_id, key,
+                )
                 continue
             setattr(target, key, value)
+            applied.append(key)
         if target.graph_id and target.graph_id not in case.graph_ids:
             case.graph_ids.append(target.graph_id)
         cls.save_case(case)
+        logger.debug(
+            "Updated case version: case_id=%s version_id=%s fields=%s",
+            case_id, version_id, ",".join(applied) or "-",
+        )
         return target
 
     @classmethod
@@ -585,6 +606,10 @@ class CaseManager:
         which replaces attributes) and link the report/simulation that produced it."""
         case = cls.get_case(case_id)
         if not case:
+            logger.warning(
+                "record_prediction_snapshot skipped: case not found case_id=%s version_id=%s report_id=%s",
+                case_id, version_id, report_id,
+            )
             return None
         target = None
         for version in case.versions:
@@ -592,6 +617,10 @@ class CaseManager:
                 target = version
                 break
         if not target:
+            logger.warning(
+                "record_prediction_snapshot skipped: version not found case_id=%s version_id=%s report_id=%s",
+                case_id, version_id, report_id,
+            )
             return None
 
         target.prediction_snapshots.append(snapshot)
@@ -601,6 +630,11 @@ class CaseManager:
             target.simulation_ids.append(simulation_id)
         target.status = "reported"
         cls.save_case(case)
+        logger.info(
+            "Recorded prediction snapshot: case_id=%s version_id=%s report_id=%s outcomes=%d",
+            case_id, version_id, report_id,
+            sum(1 for key in snapshot if not key.startswith("_")),
+        )
         return target
 
     @classmethod

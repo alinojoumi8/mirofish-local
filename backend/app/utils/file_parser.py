@@ -7,6 +7,10 @@ import os
 from pathlib import Path
 from typing import List, Optional
 
+from .logger import get_logger
+
+logger = get_logger("mirofish.file_parser")
+
 
 def _read_text_with_fallback(file_path: str) -> str:
     """
@@ -139,6 +143,7 @@ class FileParser:
                 filename = Path(file_path).name
                 all_texts.append(f"=== Document {i}: {filename} ===\n{text}")
             except Exception as e:
+                logger.warning("Failed to extract text from document %s: %s", file_path, e)
                 all_texts.append(f"=== Document {i}: {file_path} (extraction failed: {str(e)}) ===")
 
         return "\n\n".join(all_texts)

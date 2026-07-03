@@ -10,6 +10,9 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from ..config import Config
+from ..utils.logger import get_logger
+
+logger = get_logger("mirofish.forecast")
 
 
 FORECAST_MODES = {"general", "legal_case", "market_economy"}
@@ -619,8 +622,12 @@ class ForecastSynthesizer:
                     current = current if current is not None else _coerce_float(resolved.get("current_value"))
                     vol = vol if vol is not None else _coerce_float(resolved.get("volatility"))
                     base_rates = base_rates if base_rates is not None else resolved.get("base_rates")
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning(
+                    "Market-data enrichment failed for symbol=%s kind=%s: %s "
+                    "(falling back to un-enriched forecast inputs)",
+                    symbol, kind, exc,
+                )
 
         calib = self._calibration_for(kind)
 
