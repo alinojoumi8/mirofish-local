@@ -622,6 +622,13 @@ Function Flow:
 
 [Important] This feature requires the OASIS simulation environment to be running!"""
 
+TOOL_DESC_ECONOMY_EVIDENCE = """\
+[Economic Twin Evidence - Settled State]
+Read the simulation's canonical economic identities, balances, jobs, events, and
+double-entry transactions. Use this when a report makes claims about money,
+employment, trade, inequality, or agent incentives. Ledger facts are settled
+simulation evidence and should take precedence over unverified social claims."""
+
 # ── Outline Planning Prompt ──
 
 PLAN_SYSTEM_PROMPT = """\
@@ -1108,6 +1115,13 @@ class ReportAgent:
                     "interview_topic": "Interview topic or requirement description (e.g. 'understand students' views on the dorm formaldehyde incident')",
                     "max_agents": "Maximum number of agents to interview (optional, default 5, max 10)"
                 }
+            },
+            "economy_evidence": {
+                "name": "economy_evidence",
+                "description": TOOL_DESC_ECONOMY_EVIDENCE,
+                "parameters": {
+                    "limit": "Maximum recent agents, jobs, events, and transactions to return (default 25, max 100)"
+                }
             }
         }
         if self.disable_interviews:
@@ -1184,6 +1198,15 @@ class ReportAgent:
                     max_agents=max_agents
                 )
                 return result.to_text()
+
+            elif tool_name == "economy_evidence":
+                from .economy import economy_evidence
+
+                limit = parameters.get("limit", 25)
+                if isinstance(limit, str):
+                    limit = int(limit)
+                result = economy_evidence(self.simulation_id, limit=min(max(int(limit), 1), 100))
+                return json.dumps(result, ensure_ascii=False, indent=2)
             
             # ========== Backward Compatibility: Old Tools (Internal Redirect to New Tools) ==========
 
@@ -1220,14 +1243,14 @@ class ReportAgent:
                 return json.dumps(result, ensure_ascii=False, indent=2)
             
             else:
-                return f"Unknown tool: {tool_name}. Please use one of the following tools: insight_forge, panorama_search, quick_search"
+                return f"Unknown tool: {tool_name}. Please use one of the following tools: insight_forge, panorama_search, quick_search, interview_agents, economy_evidence"
 
         except Exception as e:
             logger.error(f"Tool execution failed: {tool_name}, error: {str(e)}")
             return f"Tool execution failed: {str(e)}"
     
     # Valid tool names set, used for validation when parsing raw JSON fallback
-    VALID_TOOL_NAMES = {"insight_forge", "panorama_search", "quick_search", "interview_agents"}
+    VALID_TOOL_NAMES = {"insight_forge", "panorama_search", "quick_search", "interview_agents", "economy_evidence"}
 
     def _parse_tool_calls(self, response: str) -> List[Dict[str, Any]]:
         """

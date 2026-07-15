@@ -24,6 +24,7 @@ from ..utils.logger import get_logger
 from ..utils.timing import PhaseTimer, wall_clock_timing
 from .graph_memory_updater import GraphMemoryManager
 from .simulation_ipc import SimulationIPCClient, CommandType, IPCResponse
+from .economy import normalize_economy_settings
 
 logger = get_logger('mirofish.simulation_runner')
 
@@ -334,6 +335,7 @@ class SimulationRunner:
         scenario_id: str = None,
         seed: Union[int, str, None] = None,
         memory_mode: str = None,
+        economy: Optional[Dict[str, Any]] = None,
     ) -> SimulationRunState:
         """
         Start simulation
@@ -354,6 +356,7 @@ class SimulationRunner:
             "max_rounds": max_rounds,
             "scenario_id": scenario_id,
             "memory_mode": memory_mode,
+            "economy_enabled": bool((economy or {}).get("enabled", False)),
         })
 
         # Check if already running
@@ -386,6 +389,11 @@ class SimulationRunner:
             if memory_mode:
                 config["memory_mode"] = memory_mode
                 config_changed = True
+            config["economy"] = normalize_economy_settings(
+                economy or {"enabled": False},
+                minutes_per_round=config.get("time_config", {}).get("minutes_per_round", 60),
+            )
+            config_changed = True
             if config_changed:
                 with open(config_path, 'w', encoding='utf-8') as f:
                     json.dump(config, f, ensure_ascii=False, indent=2)
@@ -1446,6 +1454,9 @@ class SimulationRunner:
             "stderr.log",
             "twitter_simulation.db",  # Twitter platform database
             "reddit_simulation.db",   # Reddit platform database
+            "economy.db",             # Economic twin ledger and state
+            "economy.db-wal",         # SQLite write-ahead log
+            "economy.db-shm",         # SQLite shared-memory file
             "env_status.json",        # Environment status file
         ]
         

@@ -163,6 +163,7 @@ from forecast_runtime import (
     select_active_agents_for_round,
     update_memory_summaries,
 )
+from app.services.economy import EconomyRuntime
 
 try:
     from llm_provider_adapter import create_oasis_model_from_env
@@ -1033,7 +1034,8 @@ async def run_twitter_simulation(
     simulation_dir: str,
     action_logger: Optional[PlatformActionLogger] = None,
     main_logger: Optional[SimulationLogManager] = None,
-    max_rounds: Optional[int] = None
+    max_rounds: Optional[int] = None,
+    economy_runtime: Optional[EconomyRuntime] = None,
 ) -> PlatformSimulation:
     """Run Twitter simulation
     
@@ -1206,6 +1208,10 @@ async def run_twitter_simulation(
             # Log round end even without active agents (actions_count=0)
             if action_logger:
                 action_logger.log_round_end(round_num + 1, 0)
+            if economy_runtime:
+                outcome = economy_runtime.maybe_run_tick(round_num + 1)
+                if outcome:
+                    log_info(f"Economic tick {outcome.get('tick')}: {len(outcome.get('results', []))} intents")
             continue
         
         for agent_id, agent in active_agents:
@@ -1222,6 +1228,10 @@ async def run_twitter_simulation(
         )
         record_actions_to_short_memory(simulation_dir, "twitter", round_num + 1, actual_actions)
         update_memory_summaries(simulation_dir, round_num + 1)
+        if economy_runtime:
+            outcome = economy_runtime.maybe_run_tick(round_num + 1)
+            if outcome:
+                log_info(f"Economic tick {outcome.get('tick')}: {len(outcome.get('results', []))} intents")
         
         round_action_count = 0
         for action_data in actual_actions:
@@ -1260,7 +1270,8 @@ async def run_reddit_simulation(
     simulation_dir: str,
     action_logger: Optional[PlatformActionLogger] = None,
     main_logger: Optional[SimulationLogManager] = None,
-    max_rounds: Optional[int] = None
+    max_rounds: Optional[int] = None,
+    economy_runtime: Optional[EconomyRuntime] = None,
 ) -> PlatformSimulation:
     """Run Reddit simulation
     
@@ -1440,6 +1451,10 @@ async def run_reddit_simulation(
             # Log round end even without active agents (actions_count=0)
             if action_logger:
                 action_logger.log_round_end(round_num + 1, 0)
+            if economy_runtime:
+                outcome = economy_runtime.maybe_run_tick(round_num + 1)
+                if outcome:
+                    log_info(f"Economic tick {outcome.get('tick')}: {len(outcome.get('results', []))} intents")
             continue
         
         for agent_id, agent in active_agents:
@@ -1456,6 +1471,10 @@ async def run_reddit_simulation(
         )
         record_actions_to_short_memory(simulation_dir, "reddit", round_num + 1, actual_actions)
         update_memory_summaries(simulation_dir, round_num + 1)
+        if economy_runtime:
+            outcome = economy_runtime.maybe_run_tick(round_num + 1)
+            if outcome:
+                log_info(f"Economic tick {outcome.get('tick')}: {len(outcome.get('results', []))} intents")
         
         round_action_count = 0
         for action_data in actual_actions:
@@ -1543,6 +1562,17 @@ async def main():
     reddit_logger = log_manager.get_reddit_logger()
     
     log_manager.info("=" * 60)
+
+    economy_runtime = None
+    if (config.get("economy") or {}).get("enabled", False):
+        try:
+            economy_runtime = EconomyRuntime(
+                config.get("simulation_id") or os.path.basename(os.path.abspath(simulation_dir)),
+                config,
+            )
+            log_manager.info("Economic twin enabled with shared cross-platform settlement")
+        except Exception as exc:
+            log_manager.error(f"Economic twin initialization failed; social simulation will continue: {exc}")
     log_manager.info("OASIS dual-platform parallel simulation")
     log_manager.info(f"Configuration file: {args.config}")
     log_manager.info(f"Simulation ID: {config.get('simulation_id', 'unknown')}")
@@ -1577,14 +1607,14 @@ async def main():
     reddit_result: Optional[PlatformSimulation] = None
     
     if args.twitter_only:
-        twitter_result = await run_twitter_simulation(config, simulation_dir, twitter_logger, log_manager, args.max_rounds)
+        twitter_result = await run_twitter_simulation(config, simulation_dir, twitter_logger, log_manager, args.max_rounds, economy_runtime)
     elif args.reddit_only:
-        reddit_result = await run_reddit_simulation(config, simulation_dir, reddit_logger, log_manager, args.max_rounds)
+        reddit_result = await run_reddit_simulation(config, simulation_dir, reddit_logger, log_manager, args.max_rounds, economy_runtime)
     else:
         # Run in parallel (each platform uses independent logger)
         results = await asyncio.gather(
-            run_twitter_simulation(config, simulation_dir, twitter_logger, log_manager, args.max_rounds),
-            run_reddit_simulation(config, simulation_dir, reddit_logger, log_manager, args.max_rounds),
+            run_twitter_simulation(config, simulation_dir, twitter_logger, log_manager, args.max_rounds, economy_runtime),
+            run_reddit_simulation(config, simulation_dir, reddit_logger, log_manager, args.max_rounds, economy_runtime),
         )
         twitter_result, reddit_result = results
     

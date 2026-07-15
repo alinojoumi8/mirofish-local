@@ -84,6 +84,26 @@ export const startSimulation = (data) => {
   return requestWithRetry(() => service.post('/api/simulation/start', data), 3, 1000)
 }
 
+export const getEconomySummary = (simulationId) => {
+  return service.get(`/api/simulation/${simulationId}/economy/summary`)
+}
+
+export const getEconomyAgents = (simulationId, params = {}) => {
+  return service.get(`/api/simulation/${simulationId}/economy/agents`, { params })
+}
+
+export const getEconomyJobs = (simulationId, params = {}) => {
+  return service.get(`/api/simulation/${simulationId}/economy/jobs`, { params })
+}
+
+export const getEconomyEvents = (simulationId, params = {}) => {
+  return service.get(`/api/simulation/${simulationId}/economy/events`, { params })
+}
+
+export const getEconomyLedger = (simulationId, params = {}) => {
+  return service.get(`/api/simulation/${simulationId}/economy/ledger`, { params })
+}
+
 /**
  * Stop simulation
  * @param {Object} data - { simulation_id }
