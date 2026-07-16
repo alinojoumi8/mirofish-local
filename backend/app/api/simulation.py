@@ -2116,7 +2116,7 @@ def _economy_store_or_404(simulation_id: str):
             "success": False,
             "error": "Economic twin is not enabled or has not started for this simulation",
         }), 404)
-    return EconomyStore(db_path), None
+    return EconomyStore(db_path, readonly=True), None
 
 
 def _economy_page() -> tuple[int, int]:

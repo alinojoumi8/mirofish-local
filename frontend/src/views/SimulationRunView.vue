@@ -53,6 +53,7 @@
           :simulationId="currentSimulationId"
           :maxRounds="maxRounds"
           :minutesPerRound="minutesPerRound"
+          :economySettings="economySettings"
           :projectData="projectData"
           :graphData="graphData"
           :systemLogs="systemLogs"
@@ -73,6 +74,7 @@ import GraphPanel from '../components/GraphPanel.vue'
 import Step3Simulation from '../components/Step3Simulation.vue'
 import { getProject, getGraphData } from '../api/graph'
 import { getSimulation, getSimulationConfig, stopSimulation, closeSimulationEnv, getEnvStatus } from '../api/simulation'
+import { economySettingsFromQuery } from '../utils/economySettings'
 
 const route = useRoute()
 const router = useRouter()
@@ -89,6 +91,7 @@ const viewMode = ref('split')
 const currentSimulationId = ref(route.params.simulationId)
 // Get maxRounds from query param during init to ensure child components get value immediately
 const maxRounds = ref(route.query.maxRounds ? parseInt(route.query.maxRounds) : null)
+const economySettings = ref(economySettingsFromQuery(route.query))
 const minutesPerRound = ref(30) // Default 30 minutes per round
 const projectData = ref(null)
 const graphData = ref(null)
@@ -301,6 +304,7 @@ onMounted(() => {
   if (maxRounds.value) {
     addLog(`Custom simulation rounds: ${maxRounds.value}`)
   }
+  addLog(`Economic twin ${economySettings.value.enabled ? 'enabled' : 'disabled'}`)
   
   loadSimulationData()
 })

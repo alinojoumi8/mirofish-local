@@ -1,3 +1,5 @@
+import asyncio
+import json
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 
@@ -9,6 +11,7 @@ from app.config import Config
 from app.services.economy import (
     EconomyRuntime,
     EconomyStore,
+    EconomyTickCoordinator,
     normalize_economy_settings,
 )
 from app.services.simulation_runner import SimulationRunner
@@ -46,6 +49,14 @@ def test_economy_settings_default_to_opt_out_and_one_simulated_day():
     assert normalize_economy_settings({"enabled": "false"})["enabled"] is False
     with pytest.raises(ValueError, match="initial_balance_cents"):
         normalize_economy_settings({"initial_balance_cents": -1})
+    with pytest.raises(ValueError, match="initial_balance_cents"):
+        normalize_economy_settings({"initial_balance_cents": 1.5})
+    with pytest.raises(ValueError, match="between 1 and 500"):
+        normalize_economy_settings({"max_decisions_per_tick": 0})
+    with pytest.raises(ValueError, match="between 1 and 500"):
+        normalize_economy_settings({"max_decisions_per_tick": 501})
+    with pytest.raises(ValueError, match="currency"):
+        normalize_economy_settings({"currency": "US"})
 
 
 def test_identity_map_and_genesis_are_idempotent(tmp_path):
@@ -191,7 +202,137 @@ def test_parallel_runtime_claims_each_tick_exactly_once(tmp_path, monkeypatch):
     assert sorted(outcome is None for outcome in outcomes) == [False, True]
     assert next(outcome for outcome in outcomes if outcome is not None)["tick"] == 1
     assert len(calls) == 1
-    assert runtime.store.summary()["ticks"] == {"total": 1, "completed": 1, "failed": 0}
+    assert runtime.store.summary()["ticks"] == {
+        "total": 1,
+        "completed": 1,
+        "failed": 0,
+        "running": 0,
+    }
+
+
+def test_coordinator_waits_for_both_platform_memories_and_settles_once(tmp_path, monkeypatch):
+    monkeypatch.setattr(Config, "OASIS_SIMULATION_DATA_DIR", str(tmp_path))
+    seen_contexts = []
+
+    def provider(contexts):
+        seen_contexts.extend(contexts)
+        return {
+            "decisions": [
+                {
+                    "economic_agent_id": item["economic_agent_id"],
+                    "action": "do_nothing",
+                    "payload": {},
+                }
+                for item in contexts
+            ]
+        }
+
+    config = {
+        "time_config": {"minutes_per_round": 60},
+        "agent_configs": PROFILES,
+        "economy": {"enabled": True, "rounds_per_tick": 1},
+    }
+    runtime = EconomyRuntime("sim-barrier", config, decision_provider=provider)
+    coordinator = EconomyTickCoordinator(runtime, {"twitter", "reddit"})
+    memory_path = tmp_path / "sim-barrier" / "agent_short_memory.json"
+
+    async def run_boundary():
+        memory_path.write_text(
+            json.dumps({"1": [{"platform": "twitter", "round_num": 1}]}),
+            encoding="utf-8",
+        )
+        twitter = asyncio.create_task(coordinator.after_round("twitter", 1))
+        await asyncio.sleep(0.05)
+        assert not twitter.done()
+        memory_path.write_text(
+            json.dumps({
+                "1": [
+                    {"platform": "twitter", "round_num": 1},
+                    {"platform": "reddit", "round_num": 1},
+                ]
+            }),
+            encoding="utf-8",
+        )
+        reddit_result = await coordinator.after_round("reddit", 1)
+        twitter_result = await twitter
+        return twitter_result, reddit_result
+
+    first, second = asyncio.run(run_boundary())
+
+    assert first is None
+    assert second["tick"] == 1
+    assert runtime.store.summary()["ticks"]["completed"] == 1
+    assert len(seen_contexts) == len(PROFILES)
+    employer_context = next(item for item in seen_contexts if item["oasis_agent_id"] == 1)
+    assert {item["platform"] for item in employer_context["social_activity"]} == {
+        "twitter",
+        "reddit",
+    }
+
+
+def test_coordinator_single_platform_settles_immediately(tmp_path, monkeypatch):
+    monkeypatch.setattr(Config, "OASIS_SIMULATION_DATA_DIR", str(tmp_path))
+    runtime = EconomyRuntime(
+        "sim-single-platform",
+        {
+            "time_config": {"minutes_per_round": 60},
+            "agent_configs": PROFILES,
+            "economy": {"enabled": True, "rounds_per_tick": 1},
+        },
+        decision_provider=lambda contexts: {
+            "decisions": [
+                {
+                    "economic_agent_id": item["economic_agent_id"],
+                    "action": "do_nothing",
+                    "payload": {},
+                }
+                for item in contexts
+            ]
+        },
+    )
+
+    outcome = asyncio.run(
+        EconomyTickCoordinator(runtime, {"twitter"}).after_round("twitter", 1)
+    )
+
+    assert outcome["tick"] == 1
+    assert runtime.store.summary()["ticks"]["completed"] == 1
+
+
+def test_interrupted_tick_recovery_fails_closed_without_replay(tmp_path, monkeypatch):
+    monkeypatch.setattr(Config, "OASIS_SIMULATION_DATA_DIR", str(tmp_path))
+    config = {
+        "time_config": {"minutes_per_round": 60},
+        "agent_configs": PROFILES,
+        "economy": {"enabled": True, "rounds_per_tick": 1},
+    }
+    interrupted = EconomyRuntime("sim-recovery", config, decision_provider=lambda _: [])
+    assert interrupted.store.claim_tick(1, 1) is True
+
+    restarted = EconomyRuntime(
+        "sim-recovery",
+        config,
+        decision_provider=lambda contexts: {
+            "decisions": [
+                {
+                    "economic_agent_id": item["economic_agent_id"],
+                    "action": "do_nothing",
+                    "payload": {},
+                }
+                for item in contexts
+            ]
+        },
+    )
+    recovered = restarted.store.summary()
+    outcome = restarted.maybe_run_tick(2)
+    summary = restarted.store.summary()
+
+    assert recovered["latest_tick"]["tick"] == 1
+    assert recovered["latest_tick"]["status"] == "failed"
+    assert "interrupted" in recovered["latest_tick"]["error"]
+    assert outcome["tick"] == 2
+    assert summary["ticks"] == {"total": 2, "completed": 1, "failed": 1, "running": 0}
+    assert any(event["event_type"] == "tick_interrupted" for event in restarted.store.list_events())
 
 
 def test_provider_parse_failure_rejects_intents_without_halting_social_runtime(tmp_path, monkeypatch):
@@ -214,6 +355,9 @@ def test_provider_parse_failure_rejects_intents_without_halting_social_runtime(t
     outcome = runtime.maybe_run_tick(1)
 
     assert outcome["metrics"]["total_supply_cents"] == 2_000_000
+    assert len(outcome["results"]) == len(PROFILES)
+    assert all(result["status"] == "rejected" for result in outcome["results"])
+    assert all("decision provider error" in result["rejection_reason"] for result in outcome["results"])
     assert runtime.halted is False
     assert runtime.store.summary()["rejected_intents"] == 2
     runtime.store.assert_invariants()
@@ -273,6 +417,25 @@ def test_economy_read_apis_expose_summary_and_evidence(tmp_path, monkeypatch):
     assert events.status_code == 200
     assert ledger.get_json()["data"]["count"] == 2
     assert missing.status_code == 404
+
+    (simulation_dir / "economy.db").unlink()
+    assert not (simulation_dir / "economy.db").exists()
+
+
+def test_readonly_store_never_initializes_or_modifies_database(tmp_path):
+    store, _agents = make_store(tmp_path)
+    db_path = tmp_path / "economy.db"
+    modified_at = db_path.stat().st_mtime_ns
+
+    readonly = EconomyStore(str(db_path), readonly=True)
+    assert readonly.summary()["latest_metrics"]["agents_count"] == 2
+    assert len(readonly.list_agents()) == 2
+    assert db_path.stat().st_mtime_ns == modified_at
+    with pytest.raises(sqlite3.OperationalError, match="readonly"):
+        readonly.configure(normalize_economy_settings({"enabled": True}))
+
+    db_path.unlink()
+    assert not db_path.exists()
 
 
 def test_force_restart_cleanup_removes_economy_database_sidecars(tmp_path, monkeypatch):

@@ -7,14 +7,17 @@ transitions, and the double-entry ledger shared by every social platform.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import math
 import os
 import sqlite3
 import threading
+from contextlib import contextmanager
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, Iterable, List, Optional
+from pathlib import Path
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional
 
 from ..config import Config
 
@@ -139,28 +142,51 @@ def _economic_agent_id(profile: Dict[str, Any]) -> str:
 class EconomyStore:
     """SQLite-backed economic state and settlement engine."""
 
-    def __init__(self, db_path: str):
+    def __init__(self, db_path: str, *, readonly: bool = False):
         self.db_path = os.path.abspath(db_path)
-        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
+        self.readonly = bool(readonly)
         self._lock = threading.RLock()
-        self.initialize_schema()
+        if not self.readonly:
+            os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
+            self.initialize_schema()
 
     @classmethod
-    def for_simulation(cls, simulation_id: str) -> "EconomyStore":
+    def for_simulation(
+        cls, simulation_id: str, *, readonly: bool = False
+    ) -> "EconomyStore":
         safe_id = str(simulation_id).strip()
         if not safe_id or safe_id in {".", ".."} or any(
             token in safe_id for token in ("/", "\\", "\x00")
         ):
             raise EconomyError("Invalid simulation id")
-        return cls(os.path.join(Config.OASIS_SIMULATION_DATA_DIR, safe_id, "economy.db"))
+        return cls(
+            os.path.join(Config.OASIS_SIMULATION_DATA_DIR, safe_id, "economy.db"),
+            readonly=readonly,
+        )
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path, timeout=30, isolation_level=None)
+        target = self.db_path
+        kwargs: Dict[str, Any] = {}
+        if self.readonly:
+            target = f"{Path(self.db_path).as_uri()}?mode=ro"
+            kwargs["uri"] = True
+        conn = sqlite3.connect(target, timeout=30, isolation_level=None, **kwargs)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
-        conn.execute("PRAGMA journal_mode = WAL")
+        if not self.readonly:
+            conn.execute("PRAGMA journal_mode = WAL")
         conn.execute("PRAGMA busy_timeout = 30000")
         return conn
+
+    @contextmanager
+    def _connection(self) -> Iterator[sqlite3.Connection]:
+        """Yield a transactional connection and always release its OS handle."""
+        conn = self._connect()
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
 
     def initialize_schema(self) -> None:
         schema = """
@@ -292,7 +318,7 @@ class EconomyStore:
             created_at TEXT NOT NULL
         );
         """
-        with self._lock, self._connect() as conn:
+        with self._lock, self._connection() as conn:
             conn.executescript(schema)
             conn.execute(
                 "INSERT OR REPLACE INTO economy_meta(key, value) VALUES('schema_version', ?)",
@@ -300,7 +326,7 @@ class EconomyStore:
             )
 
     def configure(self, settings: Dict[str, Any]) -> None:
-        with self._lock, self._connect() as conn:
+        with self._lock, self._connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
             conn.execute(
                 "INSERT OR REPLACE INTO economy_meta(key, value) VALUES('settings', ?)",
@@ -323,7 +349,7 @@ class EconomyStore:
             initial_balance_cents, "initial_balance_cents", allow_zero=True
         )
         registered: List[Dict[str, Any]] = []
-        with self._lock, self._connect() as conn:
+        with self._lock, self._connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
                 now = utc_now()
@@ -433,7 +459,7 @@ class EconomyStore:
     def resolve_agent_id(self, identifier: Any) -> Optional[str]:
         if identifier is None:
             return None
-        with self._connect() as conn:
+        with self._connection() as conn:
             return self._resolve_agent_id(conn, identifier)
 
     @staticmethod
@@ -778,7 +804,7 @@ class EconomyStore:
         if action not in SUPPORTED_ACTIONS:
             action = action or "invalid"
 
-        with self._lock, self._connect() as conn:
+        with self._lock, self._connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
                 existing = conn.execute(
@@ -860,7 +886,7 @@ class EconomyStore:
         payload: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Persist provider and parse failures without mutating economic state."""
-        with self._lock, self._connect() as conn:
+        with self._lock, self._connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
             existing = conn.execute(
                 "SELECT * FROM economic_intents WHERE idempotency_key=?", (idempotency_key,)
@@ -885,7 +911,7 @@ class EconomyStore:
             return {"intent_id": intent_id, "status": "rejected", "rejection_reason": reason}
 
     def claim_tick(self, tick: int, round_num: int) -> bool:
-        with self._lock, self._connect() as conn:
+        with self._lock, self._connection() as conn:
             try:
                 conn.execute("BEGIN IMMEDIATE")
                 conn.execute(
@@ -900,14 +926,43 @@ class EconomyStore:
 
     def finish_tick(self, tick: int, *, error: Optional[str] = None) -> None:
         status = "failed" if error else "completed"
-        with self._lock, self._connect() as conn:
+        with self._lock, self._connection() as conn:
             conn.execute(
                 "UPDATE economy_ticks SET status=?, error=?, completed_at=? WHERE tick=?",
                 (status, error, utc_now(), tick),
             )
 
+    def recover_interrupted_ticks(self) -> List[int]:
+        """Fail closed any tick left running by an interrupted process."""
+        reason = "simulation process interrupted before tick completion"
+        recovered: List[int] = []
+        with self._lock, self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                "SELECT tick, round_num FROM economy_ticks WHERE status='running' ORDER BY tick"
+            ).fetchall()
+            completed_at = utc_now()
+            for row in rows:
+                tick = int(row["tick"])
+                recovered.append(tick)
+                conn.execute(
+                    """UPDATE economy_ticks
+                       SET status='failed', error=?, completed_at=?
+                       WHERE tick=? AND status='running'""",
+                    (reason, completed_at, tick),
+                )
+                self._record_event(
+                    conn,
+                    tick=tick,
+                    event_type="tick_interrupted",
+                    actor_id=None,
+                    payload={"round_num": int(row["round_num"]), "reason": reason},
+                )
+            conn.execute("COMMIT")
+        return recovered
+
     def assert_invariants(self) -> None:
-        with self._connect() as conn:
+        with self._connection() as conn:
             imbalance = conn.execute(
                 "SELECT COALESCE(SUM(amount_cents), 0) AS total FROM ledger_entries"
             ).fetchone()["total"]
@@ -942,27 +997,37 @@ class EconomyStore:
         weighted = sum((index + 1) * value for index, value in enumerate(ordered))
         return round((2 * weighted) / (n * sum(ordered)) - (n + 1) / n, 6)
 
+    def _metrics_snapshot(self, conn: sqlite3.Connection, tick: int) -> Dict[str, Any]:
+        balances = [row["balance_cents"] for row in self.list_agents(conn=conn)]
+        employed = conn.execute(
+            "SELECT COUNT(*) AS n FROM jobs WHERE status='hired'"
+        ).fetchone()["n"]
+        open_jobs = conn.execute(
+            "SELECT COUNT(*) AS n FROM jobs WHERE status='open'"
+        ).fetchone()["n"]
+        completed = conn.execute(
+            "SELECT COUNT(*) AS n FROM jobs WHERE status='completed'"
+        ).fetchone()["n"]
+        volume = conn.execute(
+            """SELECT COALESCE(SUM(amount_cents), 0) AS n FROM transactions
+               WHERE tick=? AND action_type != 'genesis'""",
+            (tick,),
+        ).fetchone()["n"]
+        return {
+            "tick": tick,
+            "agents_count": len(balances),
+            "total_supply_cents": sum(balances),
+            "employed_count": int(employed),
+            "open_jobs": int(open_jobs),
+            "completed_jobs": int(completed),
+            "trade_volume_cents": int(volume),
+            "gini": self._gini(balances),
+            "created_at": utc_now(),
+        }
+
     def record_metrics(self, tick: int) -> Dict[str, Any]:
-        with self._lock, self._connect() as conn:
-            balances = [row["balance_cents"] for row in self.list_agents(conn=conn)]
-            employed = conn.execute("SELECT COUNT(*) AS n FROM jobs WHERE status='hired'").fetchone()["n"]
-            open_jobs = conn.execute("SELECT COUNT(*) AS n FROM jobs WHERE status='open'").fetchone()["n"]
-            completed = conn.execute("SELECT COUNT(*) AS n FROM jobs WHERE status='completed'").fetchone()["n"]
-            volume = conn.execute(
-                "SELECT COALESCE(SUM(amount_cents), 0) AS n FROM transactions WHERE tick=? AND action_type != 'genesis'",
-                (tick,),
-            ).fetchone()["n"]
-            metrics = {
-                "tick": tick,
-                "agents_count": len(balances),
-                "total_supply_cents": sum(balances),
-                "employed_count": int(employed),
-                "open_jobs": int(open_jobs),
-                "completed_jobs": int(completed),
-                "trade_volume_cents": int(volume),
-                "gini": self._gini(balances),
-                "created_at": utc_now(),
-            }
+        with self._lock, self._connection() as conn:
+            metrics = self._metrics_snapshot(conn, tick)
             conn.execute(
                 """INSERT OR REPLACE INTO economy_metrics(
                     tick, agents_count, total_supply_cents, employed_count,
@@ -999,7 +1064,7 @@ class EconomyStore:
                 active.close()
 
     def list_jobs(self, *, limit: int = 200, offset: int = 0) -> List[Dict[str, Any]]:
-        with self._connect() as conn:
+        with self._connection() as conn:
             rows = conn.execute(
                 """SELECT j.*, employer.name AS employer_name, worker.name AS worker_name
                    FROM jobs j
@@ -1011,7 +1076,7 @@ class EconomyStore:
             return [dict(row) for row in rows]
 
     def list_events(self, *, limit: int = 200, offset: int = 0) -> List[Dict[str, Any]]:
-        with self._connect() as conn:
+        with self._connection() as conn:
             rows = conn.execute(
                 """SELECT ev.*, actor.name AS actor_name, counterparty.name AS counterparty_name
                    FROM economy_events ev
@@ -1028,7 +1093,7 @@ class EconomyStore:
             return result
 
     def list_ledger(self, *, limit: int = 200, offset: int = 0) -> List[Dict[str, Any]]:
-        with self._connect() as conn:
+        with self._connection() as conn:
             rows = conn.execute(
                 """SELECT t.transaction_id, t.tick, t.action_type, t.actor_id,
                           t.counterparty_id, t.amount_cents, t.payload_json, t.created_at,
@@ -1047,7 +1112,7 @@ class EconomyStore:
             return result
 
     def list_trades(self, *, limit: int = 200, offset: int = 0) -> List[Dict[str, Any]]:
-        with self._connect() as conn:
+        with self._connection() as conn:
             rows = conn.execute(
                 """SELECT t.*, buyer.name AS buyer_name, seller.name AS seller_name
                    FROM trades t
@@ -1064,13 +1129,21 @@ class EconomyStore:
             return result
 
     def summary(self) -> Dict[str, Any]:
-        with self._connect() as conn:
+        with self._connection() as conn:
             meta = {row["key"]: row["value"] for row in conn.execute("SELECT key, value FROM economy_meta")}
             latest = conn.execute(
                 "SELECT * FROM economy_metrics ORDER BY tick DESC LIMIT 1"
             ).fetchone()
             ticks = conn.execute(
-                "SELECT COUNT(*) AS total, SUM(status='completed') AS completed, SUM(status='failed') AS failed FROM economy_ticks"
+                """SELECT COUNT(*) AS total,
+                          SUM(status='completed') AS completed,
+                          SUM(status='failed') AS failed,
+                          SUM(status='running') AS running
+                   FROM economy_ticks"""
+            ).fetchone()
+            latest_tick = conn.execute(
+                """SELECT tick, round_num, status, error, started_at, completed_at
+                   FROM economy_ticks ORDER BY tick DESC LIMIT 1"""
             ).fetchone()
             rejected = conn.execute(
                 "SELECT COUNT(*) AS n FROM economic_intents WHERE status='rejected'"
@@ -1081,17 +1154,19 @@ class EconomyStore:
                 "status": meta.get("status", "ready"),
                 "schema_version": int(meta.get("schema_version", SCHEMA_VERSION)),
                 "settings": settings,
-                "latest_metrics": dict(latest) if latest else self.record_metrics(0),
+                "latest_metrics": dict(latest) if latest else self._metrics_snapshot(conn, 0),
                 "ticks": {
                     "total": int(ticks["total"] or 0),
                     "completed": int(ticks["completed"] or 0),
                     "failed": int(ticks["failed"] or 0),
+                    "running": int(ticks["running"] or 0),
                 },
+                "latest_tick": dict(latest_tick) if latest_tick else None,
                 "rejected_intents": int(rejected),
             }
 
     def recent_context_for_agent(self, agent_id: str, *, limit: int = 8) -> Dict[str, Any]:
-        with self._connect() as conn:
+        with self._connection() as conn:
             jobs = [dict(row) for row in conn.execute(
                 """SELECT job_id, title, wage_cents, status, employer_id, worker_id
                    FROM jobs WHERE employer_id=? OR worker_id=? ORDER BY updated_tick DESC LIMIT ?""",
@@ -1130,6 +1205,7 @@ class EconomyRuntime:
         self.store: Optional[EconomyStore] = None
         if self.enabled:
             self.store = EconomyStore.for_simulation(simulation_id)
+            self.store.recover_interrupted_ticks()
             self.store.configure(self.settings)
             profiles = config.get("agent_configs") or []
             self.store.register_agents(
@@ -1161,7 +1237,12 @@ class EconomyRuntime:
                 "content": _json({"agents": contexts}),
             },
         ]
-        return client.chat_json(messages, temperature=0.0, max_tokens=4096)
+        return client.chat_json(
+            messages,
+            temperature=0.0,
+            max_tokens=4096,
+            disable_reasoning=True,
+        )
 
     @staticmethod
     def _normalize_decisions(raw: Any) -> Dict[str, Dict[str, Any]]:
@@ -1246,28 +1327,19 @@ class EconomyRuntime:
         tick: int,
         agents: List[Dict[str, Any]],
         contexts: List[Dict[str, Any]],
-    ) -> tuple[Dict[str, Dict[str, Any]], bool]:
+    ) -> tuple[Dict[str, Dict[str, Any]], Optional[str]]:
         provider = self._decision_provider or self._default_decisions
         try:
-            return self._normalize_decisions(provider(contexts)), False
+            return self._normalize_decisions(provider(contexts)), None
         except Exception as exc:
-            reason = f"decision provider error: {exc}"
-            for agent in agents:
-                economic_id = agent["economic_agent_id"]
-                self.store.reject_intent(
-                    tick=tick,
-                    actor_id=economic_id,
-                    idempotency_key=f"tick:{tick}:agent:{economic_id}",
-                    reason=reason,
-                )
-            return {}, True
+            return {}, f"decision provider error: {exc}"
 
     def _apply_decisions(
         self,
         tick: int,
         agents: List[Dict[str, Any]],
         decisions: Dict[str, Dict[str, Any]],
-        provider_failed: bool,
+        provider_error: Optional[str],
     ) -> List[Dict[str, Any]]:
         results = []
         for agent in agents:
@@ -1282,13 +1354,13 @@ class EconomyRuntime:
                         idempotency_key=key,
                     )
                 )
-            elif not provider_failed:
+            else:
                 results.append(
                     self.store.reject_intent(
                         tick=tick,
                         actor_id=economic_id,
                         idempotency_key=key,
-                        reason="decision provider omitted agent",
+                        reason=provider_error or "decision provider omitted agent",
                     )
                 )
         return results
@@ -1296,7 +1368,7 @@ class EconomyRuntime:
     def _halt_economy(self, tick: int, round_num: int, error: str) -> Dict[str, Any]:
         self.halted = True
         self.store.finish_tick(tick, error=error)
-        with self.store._connect() as conn:
+        with self.store._connection() as conn:
             conn.execute(
                 "INSERT OR REPLACE INTO economy_meta(key, value) VALUES('status', 'halted')"
             )
@@ -1320,8 +1392,8 @@ class EconomyRuntime:
             try:
                 all_agents, agents = self._select_agents_for_tick(tick)
                 contexts = self._build_decision_contexts(all_agents, agents, social_context)
-                decisions, provider_failed = self._request_decisions(tick, agents, contexts)
-                results = self._apply_decisions(tick, agents, decisions, provider_failed)
+                decisions, provider_error = self._request_decisions(tick, agents, contexts)
+                results = self._apply_decisions(tick, agents, decisions, provider_error)
                 self.store.assert_invariants()
                 metrics = self.store.record_metrics(tick)
                 self.store.finish_tick(tick)
@@ -1333,6 +1405,58 @@ class EconomyRuntime:
                 return {"tick": tick, "round_num": round_num, "error": str(exc)}
 
 
+class EconomyTickCoordinator:
+    """Synchronize social platforms before executing each economic tick once."""
+
+    def __init__(self, runtime: EconomyRuntime, platforms: Iterable[str]):
+        self.runtime = runtime
+        self.platforms = {str(platform).strip().lower() for platform in platforms}
+        if not self.platforms or "" in self.platforms:
+            raise EconomyError("EconomyTickCoordinator requires at least one platform")
+        self._lock = asyncio.Lock()
+        self._rounds: Dict[int, Dict[str, Any]] = {}
+        self._completed_rounds: set[int] = set()
+
+    async def after_round(
+        self, platform: str, round_num: int
+    ) -> Optional[Dict[str, Any]]:
+        """Wait at a tick boundary until every enabled platform has persisted."""
+        platform_name = str(platform).strip().lower()
+        if platform_name not in self.platforms:
+            raise EconomyError(f"Unknown economy platform: {platform}")
+        if not self.runtime.enabled or self.runtime.halted:
+            return None
+        rounds_per_tick = int(self.runtime.settings["rounds_per_tick"])
+        if round_num <= 0 or round_num % rounds_per_tick != 0:
+            return None
+
+        async with self._lock:
+            if round_num in self._completed_rounds:
+                return None
+            state = self._rounds.get(round_num)
+            if state is None:
+                state = {"arrivals": set(), "event": asyncio.Event()}
+                self._rounds[round_num] = state
+            if platform_name in state["arrivals"]:
+                return None
+            state["arrivals"].add(platform_name)
+            should_settle = state["arrivals"] == self.platforms
+            event = state["event"]
+
+        if not should_settle:
+            await event.wait()
+            return None
+
+        try:
+            outcome = await asyncio.to_thread(self.runtime.maybe_run_tick, round_num)
+        finally:
+            async with self._lock:
+                self._completed_rounds.add(round_num)
+                self._rounds.pop(round_num, None)
+                event.set()
+        return outcome
+
+
 def economy_evidence(simulation_id: str, *, limit: int = 25) -> Dict[str, Any]:
     """Read-only evidence bundle used by APIs and the report agent."""
     safe_id = str(simulation_id).strip()
@@ -1341,7 +1465,7 @@ def economy_evidence(simulation_id: str, *, limit: int = 25) -> Dict[str, Any]:
     db_path = os.path.join(Config.OASIS_SIMULATION_DATA_DIR, safe_id, "economy.db")
     if not os.path.isfile(db_path):
         raise EconomyError("Economic twin evidence is not available for this simulation")
-    store = EconomyStore(db_path)
+    store = EconomyStore(db_path, readonly=True)
     return {
         "summary": store.summary(),
         "agents": store.list_agents(limit=limit),

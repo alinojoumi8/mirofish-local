@@ -54,7 +54,7 @@ from forecast_runtime import (
     record_actions_to_short_memory,
     select_active_agents_for_round,
 )
-from app.services.economy import EconomyRuntime
+from app.services.economy import EconomyRuntime, EconomyTickCoordinator
 
 
 class UnicodeFormatter(logging.Formatter):
@@ -420,11 +420,15 @@ class RedditSimulationRunner:
         self.config = self._load_config()
         self.simulation_dir = os.path.dirname(config_path)
         self.economy_runtime = None
+        self.economy_coordinator = None
         if (self.config.get("economy") or {}).get("enabled", False):
             try:
                 self.economy_runtime = EconomyRuntime(
                     self.config.get("simulation_id") or os.path.basename(os.path.abspath(self.simulation_dir)),
                     self.config,
+                )
+                self.economy_coordinator = EconomyTickCoordinator(
+                    self.economy_runtime, {"reddit"}
                 )
             except Exception as exc:
                 print(f"Economic twin initialization failed; social simulation will continue: {exc}")
@@ -607,8 +611,10 @@ class RedditSimulationRunner:
             )
             
             if not active_agents:
-                if self.economy_runtime:
-                    outcome = self.economy_runtime.maybe_run_tick(round_num + 1)
+                if self.economy_coordinator:
+                    outcome = await self.economy_coordinator.after_round(
+                        "reddit", round_num + 1
+                    )
                     if outcome:
                         print(f"  Economic tick {outcome.get('tick')}: {len(outcome.get('results', []))} intents")
                 continue
@@ -631,8 +637,10 @@ class RedditSimulationRunner:
             }
             
             await self.env.step(actions)
-            if self.economy_runtime:
-                outcome = self.economy_runtime.maybe_run_tick(round_num + 1)
+            if self.economy_coordinator:
+                outcome = await self.economy_coordinator.after_round(
+                    "reddit", round_num + 1
+                )
                 if outcome:
                     print(f"  Economic tick {outcome.get('tick')}: {len(outcome.get('results', []))} intents")
             

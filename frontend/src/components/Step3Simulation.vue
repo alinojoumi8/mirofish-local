@@ -307,6 +307,21 @@
           <span class="metric-value mono">{{ economyMetrics.gini ?? '0.000' }}</span>
           <span class="metric-label">Gini</span>
         </div>
+        <div class="diagnostic-metric">
+          <span class="metric-value mono">{{ economySummary.rejected_intents || 0 }}</span>
+          <span class="metric-label">Rejected Intents</span>
+        </div>
+        <div class="diagnostic-metric">
+          <span class="metric-value mono">{{ economySummary.ticks?.running || 0 }}</span>
+          <span class="metric-label">Running Ticks</span>
+        </div>
+        <div class="diagnostic-metric">
+          <span class="metric-value mono">{{ economySummary.ticks?.failed || 0 }}</span>
+          <span class="metric-label">Failed Ticks</span>
+        </div>
+      </div>
+      <div v-if="economySummary.latest_tick?.error" class="economy-error">
+        <strong>Latest tick error:</strong> {{ economySummary.latest_tick.error }}
       </div>
       <div class="economy-events">
         <span class="list-title">Settled events</span>
@@ -390,10 +405,18 @@ import {
   getEconomyEvents
 } from '../api/simulation'
 import { generateReport } from '../api/report'
+import {
+  DEFAULT_ECONOMY_SETTINGS,
+  normalizeEconomySettings
+} from '../utils/economySettings'
 
 const props = defineProps({
   simulationId: String,
   maxRounds: Number, // Max rounds passed from Step2
+  economySettings: {
+    type: Object,
+    default: () => ({ ...DEFAULT_ECONOMY_SETTINGS })
+  },
   minutesPerRound: {
     type: Number,
     default: 30 // Default: 30 minutes per round
@@ -522,6 +545,7 @@ const doStartSimulation = async () => {
   emit('update-status', 'processing')
 
   try {
+    const economy = normalizeEconomySettings(props.economySettings)
     const params = {
       simulation_id: props.simulationId,
       platform: 'parallel',
@@ -530,12 +554,7 @@ const doStartSimulation = async () => {
       scenario_id: 'baseline',
       seed: Date.now() % 1000000,
       memory_mode: 'off',
-      economy: {
-        enabled: true,
-        initial_balance_cents: 1000000,
-        max_decisions_per_tick: 50,
-        currency: 'USD'
-      }
+      economy
     }
 
     if (props.maxRounds) {
@@ -543,7 +562,11 @@ const doStartSimulation = async () => {
       addLog(`Set max simulation rounds: ${props.maxRounds}`)
     }
 
-    addLog('Economic twin enabled: shared identities, daily decisions, and balanced settlement')
+    addLog(
+      economy.enabled
+        ? 'Economic twin enabled: shared identities, synchronized decisions, and balanced settlement'
+        : 'Economic twin disabled for this run'
+    )
 
     const res = await startSimulation(params)
 
@@ -559,7 +582,7 @@ const doStartSimulation = async () => {
 
       startStatusPolling()
       startDetailPolling()
-      startEconomyPolling()
+      if (economy.enabled) startEconomyPolling()
     } else {
       startError.value = res.error || 'Start failed'
       addLog(`✗ Start failed: ${res.error || 'Unknown error'}`)
@@ -684,7 +707,7 @@ const fetchRunStatus = async () => {
 }
 
 const loadEconomy = async () => {
-  if (!props.simulationId) return
+  if (!props.simulationId || !props.economySettings?.enabled) return
   try {
     const [summaryRes, eventsRes] = await Promise.all([
       getEconomySummary(props.simulationId),
@@ -1114,6 +1137,16 @@ onUnmounted(() => {
   border-radius: 4px;
   padding: 8px;
   background: #FFFFFF;
+}
+
+.economy-error {
+  margin-top: 8px;
+  border: 1px solid #FECACA;
+  border-radius: 4px;
+  padding: 8px 10px;
+  color: #991B1B;
+  background: #FEF2F2;
+  font-size: 11px;
 }
 
 .economy-event-row strong {
