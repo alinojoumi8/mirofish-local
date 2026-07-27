@@ -16,6 +16,7 @@ from ..services.simulation_manager import SimulationManager, SimulationStatus
 from ..services.simulation_runner import SimulationRunner, RunnerStatus
 from ..services.report_agent import ReportManager
 from ..services.forecasting import normalize_forecast_settings
+from ..services.economy import EconomyStore
 from ..models.case import normalize_prediction_settings
 from ..utils.logger import get_logger
 from ..models.project import ProjectManager
@@ -1522,6 +1523,12 @@ def start_simulation():
             "platform": "parallel",                // Optional: twitter / reddit / parallel (Default)
             "max_rounds": 100,                     // Optional: Maximum simulation rounds, default unlimited
             "enable_graph_memory_update": false,   // Optional: Whether to enable knowledge graph memory updates for agents
+            "economy": {                           // Optional: Economic Twin (default disabled)
+                "enabled": true,
+                "initial_balance_cents": 1000000,
+                "max_decisions_per_tick": 50,
+                "currency": "USD"
+            },
             "force": false                         // Optional: Force restart (stop running simulation and clean runtime files)
         }
 
@@ -1569,6 +1576,12 @@ def start_simulation():
         scenario_id = data.get('scenario_id')
         seed = data.get('seed')
         memory_mode = data.get('memory_mode')
+        economy = data.get('economy')
+        if economy is not None and not isinstance(economy, dict):
+            return jsonify({
+                "success": False,
+                "error": "economy must be an object"
+            }), 400
 
         # Verify max_rounds Parameters
         if max_rounds is not None:
@@ -1704,6 +1717,7 @@ def start_simulation():
             scenario_id=scenario_id,
             seed=seed,
             memory_mode=memory_mode,
+            economy=economy,
         )
         
         # Update simulation status
@@ -1724,6 +1738,11 @@ def start_simulation():
         if memory_mode:
             response_data['memory_mode'] = memory_mode
         response_data['prediction_settings'] = prediction_settings
+        economy_config_path = os.path.join(
+            Config.OASIS_SIMULATION_DATA_DIR, simulation_id, "simulation_config.json"
+        )
+        with open(economy_config_path, 'r', encoding='utf-8') as economy_config_file:
+            response_data['economy'] = json.load(economy_config_file).get('economy', {"enabled": False})
         
         return jsonify({
             "success": True,
@@ -2084,6 +2103,101 @@ def get_agent_stats(simulation_id: str):
             "error": str(e),
             "traceback": traceback.format_exc()
         }), 500
+
+
+def _economy_store_or_404(simulation_id: str):
+    if not simulation_id or simulation_id in {".", ".."} or any(
+        token in simulation_id for token in ("/", "\\", "\x00")
+    ):
+        return None, (jsonify({"success": False, "error": "Invalid simulation id"}), 400)
+    db_path = os.path.join(Config.OASIS_SIMULATION_DATA_DIR, simulation_id, "economy.db")
+    if not os.path.isfile(db_path):
+        return None, (jsonify({
+            "success": False,
+            "error": "Economic twin is not enabled or has not started for this simulation",
+        }), 404)
+    return EconomyStore(db_path, readonly=True), None
+
+
+def _economy_page() -> tuple[int, int]:
+    requested_limit = request.args.get("limit", 100, type=int)
+    requested_offset = request.args.get("offset", 0, type=int)
+    limit = min(max(requested_limit if requested_limit is not None else 100, 1), 1000)
+    offset = max(requested_offset if requested_offset is not None else 0, 0)
+    return limit, offset
+
+
+@simulation_bp.route('/<simulation_id>/economy/summary', methods=['GET'])
+def get_economy_summary(simulation_id: str):
+    """Get the latest economic metrics and runtime health."""
+    try:
+        store, error = _economy_store_or_404(simulation_id)
+        if error:
+            return error
+        return jsonify({"success": True, "data": store.summary()})
+    except Exception as exc:
+        logger.error(f"Failed to get economy summary: {exc}")
+        return jsonify({"success": False, "error": str(exc)}), 500
+
+
+@simulation_bp.route('/<simulation_id>/economy/agents', methods=['GET'])
+def get_economy_agents(simulation_id: str):
+    """Get canonical cross-platform identities and wallet balances."""
+    try:
+        store, error = _economy_store_or_404(simulation_id)
+        if error:
+            return error
+        limit, offset = _economy_page()
+        agents = store.list_agents(limit=limit, offset=offset)
+        return jsonify({"success": True, "data": {"agents": agents, "count": len(agents)}})
+    except Exception as exc:
+        logger.error(f"Failed to get economy agents: {exc}")
+        return jsonify({"success": False, "error": str(exc)}), 500
+
+
+@simulation_bp.route('/<simulation_id>/economy/jobs', methods=['GET'])
+def get_economy_jobs(simulation_id: str):
+    """Get jobs and their validated state transitions."""
+    try:
+        store, error = _economy_store_or_404(simulation_id)
+        if error:
+            return error
+        limit, offset = _economy_page()
+        jobs = store.list_jobs(limit=limit, offset=offset)
+        return jsonify({"success": True, "data": {"jobs": jobs, "count": len(jobs)}})
+    except Exception as exc:
+        logger.error(f"Failed to get economy jobs: {exc}")
+        return jsonify({"success": False, "error": str(exc)}), 500
+
+
+@simulation_bp.route('/<simulation_id>/economy/events', methods=['GET'])
+def get_economy_events(simulation_id: str):
+    """Get the economic event stream."""
+    try:
+        store, error = _economy_store_or_404(simulation_id)
+        if error:
+            return error
+        limit, offset = _economy_page()
+        events = store.list_events(limit=limit, offset=offset)
+        return jsonify({"success": True, "data": {"events": events, "count": len(events)}})
+    except Exception as exc:
+        logger.error(f"Failed to get economy events: {exc}")
+        return jsonify({"success": False, "error": str(exc)}), 500
+
+
+@simulation_bp.route('/<simulation_id>/economy/ledger', methods=['GET'])
+def get_economy_ledger(simulation_id: str):
+    """Get transaction-level ledger evidence with balance checks."""
+    try:
+        store, error = _economy_store_or_404(simulation_id)
+        if error:
+            return error
+        limit, offset = _economy_page()
+        entries = store.list_ledger(limit=limit, offset=offset)
+        return jsonify({"success": True, "data": {"transactions": entries, "count": len(entries)}})
+    except Exception as exc:
+        logger.error(f"Failed to get economy ledger: {exc}")
+        return jsonify({"success": False, "error": str(exc)}), 500
 
 
 @simulation_bp.route('/<simulation_id>/diagnostics', methods=['GET'])

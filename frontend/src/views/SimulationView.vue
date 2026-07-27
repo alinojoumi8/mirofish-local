@@ -70,6 +70,7 @@ import GraphPanel from '../components/GraphPanel.vue'
 import Step2EnvSetup from '../components/Step2EnvSetup.vue'
 import { getProject, getGraphData } from '../api/graph'
 import { getSimulation, stopSimulation, getEnvStatus, closeSimulationEnv } from '../api/simulation'
+import { economySettingsToQuery } from '../utils/economySettings'
 
 const route = useRoute()
 const router = useRouter()
@@ -158,12 +159,13 @@ const handleNextStep = (params = {}) => {
   // Build route parameters
   const routeParams = {
     name: 'SimulationRun',
-    params: { simulationId: currentSimulationId.value }
+    params: { simulationId: currentSimulationId.value },
+    query: economySettingsToQuery(params.economy)
   }
 
   // If custom rounds exist, pass via query parameters
   if (params.maxRounds) {
-    routeParams.query = { maxRounds: params.maxRounds }
+    routeParams.query.maxRounds = params.maxRounds
   }
 
   // Navigate to Step 3 page
