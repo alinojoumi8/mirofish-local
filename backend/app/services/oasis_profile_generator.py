@@ -225,13 +225,8 @@ class OasisProfileGenerator:
         self.base_url = base_url or Config.LLM_BASE_URL
         self.model_name = model_name or Config.LLM_MODEL_NAME
 
-        if not self.api_key:
-            raise ValueError("LLM_API_KEY not configured")
-
-        self.client = OpenAI(
-            api_key=self.api_key,
-            base_url=self.base_url
-        )
+        # Template-only profiles do not need an LLM connection or credentials.
+        self.client = None
 
         # GraphStorage for hybrid search enrichment
         self.storage = storage
@@ -516,6 +511,11 @@ class OasisProfileGenerator:
         - Individual entities: generate specific character profiles
         - Group/institutional entities: generate representative account profiles
         """
+
+        if self.client is None:
+            if not self.api_key:
+                raise ValueError("LLM_API_KEY not configured")
+            self.client = OpenAI(api_key=self.api_key, base_url=self.base_url)
 
         is_individual = self._is_individual_entity(entity_type)
 

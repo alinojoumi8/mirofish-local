@@ -20,6 +20,8 @@ class FakeGraphStorage:
 
 def test_prepare_simulation_accepts_prediction_settings_without_profile_generator_error(tmp_path, monkeypatch):
     monkeypatch.setattr(SimulationManager, "SIMULATION_DATA_DIR", str(tmp_path))
+    # Config generation is mocked; do not depend on a developer .env credential.
+    monkeypatch.setattr("app.services.simulation_config_generator.Config.LLM_API_KEY", "unit-test-key")
 
     def fake_generate_config(self, **kwargs):
         return SimulationParameters(
@@ -51,3 +53,13 @@ def test_prepare_simulation_accepts_prediction_settings_without_profile_generato
     assert prepared.profiles_count == 1
     assert (tmp_path / state.simulation_id / "reddit_profiles.json").exists()
     assert (tmp_path / state.simulation_id / "simulation_config.json").exists()
+
+
+def test_template_profile_generation_needs_no_llm_credentials(monkeypatch):
+    from app.services.entity_reader import EntityNode
+    from app.services.oasis_profile_generator import OasisProfileGenerator
+    monkeypatch.setattr("app.services.oasis_profile_generator.Config.LLM_API_KEY", None)
+    generator = OasisProfileGenerator()
+    entity = EntityNode(uuid="entity-1", name="Acme", labels=["Entity", "Company"], summary="A company", attributes={})
+    profile = generator.generate_profile_from_entity(entity, user_id=1, use_llm=False)
+    assert profile.name == "Acme"
