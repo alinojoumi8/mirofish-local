@@ -546,7 +546,9 @@ class ForecastSynthesizer:
         """Higher agreement across seeded runs (lower spread) → higher confidence."""
         stds = ensemble.get("probability_std") or []
         avg_std = (sum(stds) / len(stds)) if stds else 1.0
-        runs = ensemble.get("runs", 1)
+        runs = ensemble.get("completed_runs", ensemble.get("runs", 1))
+        if runs < 2:
+            return "low"
         if runs >= 3 and avg_std < 0.04:
             return "high"
         if runs >= 3 and avg_std < 0.08:
@@ -711,7 +713,7 @@ class ForecastSynthesizer:
             ]
             confidence = self._ensemble_confidence(ensemble)
             limitations = (
-                f"Probabilities are the mean across {ensemble['runs']} seeded simulation runs "
+                f"Probabilities are the mean across {ensemble.get('completed_runs', ensemble['runs'])} completed seeded simulation runs "
                 f"(net sentiment {ensemble.get('mean_net', 0):+.2f} ± {ensemble.get('std_net', 0):.2f}; "
                 f"{ensemble.get('total_actions', 0)} total agent actions). Lower spread across runs means "
                 "higher confidence. Treat as scenario estimates; add external base rates for decisions."

@@ -48,7 +48,7 @@ The [original MiroFish](https://github.com/666ghj/MiroFish) was built for the Ch
 ### Prerequisites
 
 - Docker & Docker Compose (recommended), **or**
-- Python 3.11+, Node.js 18+, Neo4j 5.15+, Ollama
+- Python 3.11+, Node.js 20.19+ or 22.13+ (supported LTS), Neo4j 5.18+, Ollama
 
 ### Option A: Docker (easiest)
 

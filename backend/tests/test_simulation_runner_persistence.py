@@ -84,3 +84,28 @@ def test_reconciliation_keeps_live_recorded_process_running(tmp_path, monkeypatc
         assert database.get_simulation_run("sim_live")["runner_status"] == "running"
     finally:
         _reset_runner()
+
+
+def test_cleanup_removes_authoritative_state_even_without_artifact_directory(tmp_path, monkeypatch):
+    database = ControlDatabase(tmp_path / "control.db")
+    monkeypatch.setattr(SimulationRunner, "RUN_STATE_DIR", str(tmp_path / "simulations"))
+    SimulationRunner.configure_repository(database)
+    database.put_simulation_run({"simulation_id": "sim_old", "runner_status": "completed"})
+    try:
+        assert SimulationRunner.cleanup_simulation_logs("sim_old")["success"]
+        assert SimulationRunner.get_run_state("sim_old") is None
+    finally:
+        _reset_runner()
+
+
+def test_cleanup_removes_previous_forecast_and_agent_memories(tmp_path, monkeypatch):
+    monkeypatch.setattr(SimulationRunner, "RUN_STATE_DIR", str(tmp_path))
+    sim_dir = tmp_path / "sim_old"
+    sim_dir.mkdir()
+    names = ("ensemble_signal.json", "agent_short_memory.json", "agent_memory_summaries.json")
+    for name in names:
+        (sim_dir / name).write_text('{}')
+    (sim_dir / "simulation_config.json").write_text('{}')
+    assert SimulationRunner.cleanup_simulation_logs("sim_old")["success"]
+    assert all(not (sim_dir / name).exists() for name in names)
+    assert (sim_dir / "simulation_config.json").exists()

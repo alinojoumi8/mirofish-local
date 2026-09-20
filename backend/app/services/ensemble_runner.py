@@ -13,6 +13,7 @@ prefers over a single run when present.
 from __future__ import annotations
 
 import json
+import math
 import os
 import statistics
 import time
@@ -45,6 +46,7 @@ class EnsembleRunner:
         platform: str = "parallel",
         storage: Any = None,
         memory_mode: str = "practical",
+        economy: Optional[Dict[str, Any]] = None,
         per_run_timeout: float = 1200.0,
         progress_callback: Optional[Callable[[int, int, Optional[Dict[str, Any]]], None]] = None,
     ) -> Dict[str, Any]:
@@ -59,6 +61,7 @@ class EnsembleRunner:
         outcomes = list(settings.prediction_target.get("outcomes") or DEFAULT_OUTCOMES[mode])[:5]
         runs = max(1, min(int(runs or settings.ensemble_runs or cls.DEFAULT_RUNS), cls.MAX_RUNS))
         graph_id = config.get("graph_id")
+        economy = config.get("economy") if economy is None else economy
 
         per_run_net: List[float] = []
         per_run_probs: List[List[float]] = []
@@ -78,6 +81,7 @@ class EnsembleRunner:
                     scenario_id="baseline",
                     seed=seed,
                     memory_mode=memory_mode,
+                    economy=economy,
                 )
             except Exception as exc:  # pragma: no cover - defensive
                 logger.error("Ensemble run %s/%s failed to start: %s", i + 1, runs, exc)
@@ -86,8 +90,20 @@ class EnsembleRunner:
                 continue
 
             completed = cls._wait_for_completion(simulation_id, per_run_timeout)
-            signal = ForecastSynthesizer(simulation_id, config).build_simulation_signal()
-            net = float(signal.get("net_sentiment", 0.0)) if signal else 0.0
+            signal = (
+                ForecastSynthesizer(simulation_id, config).build_simulation_signal()
+                if completed else None
+            )
+            try:
+                net = float(signal["net_sentiment"]) if signal else float("nan")
+                usable = bool(signal and signal.get("total_actions", 0) > 0 and math.isfinite(net))
+            except (KeyError, TypeError, ValueError):
+                usable = False
+            if not usable:
+                logger.warning("Ensemble run %s/%s produced no usable completed sample", i + 1, runs)
+                if progress_callback:
+                    progress_callback(i + 1, runs, None)
+                continue
             per_run_signals.append(signal)
             per_run_net.append(net)
             per_run_probs.append(net_to_probabilities(net, outcomes, mode, span=0.5))
@@ -99,10 +115,13 @@ class EnsembleRunner:
             if progress_callback:
                 progress_callback(i + 1, runs, signal)
 
+        # Stop the final environment without deleting its source evidence. Destructive
+        # cleanup belongs before each sample, before the aggregate is persisted.
+        cls._shutdown(simulation_id)
+        if not per_run_signals:
+            raise RuntimeError("Ensemble produced no usable completed simulation runs")
         aggregate = cls._aggregate(runs, outcomes, mode, per_run_net, per_run_probs, per_run_signals)
         cls._persist(simulation_id, aggregate)
-        # Leave the environment closed so it can be cleanly restarted later.
-        cls._reset(simulation_id)
         return aggregate
 
     # ------------------------------------------------------------------ helpers
@@ -119,6 +138,14 @@ class EnsembleRunner:
     def _reset(cls, simulation_id: str) -> None:
         """Best-effort: gracefully close any live env, stop a running process, and
         clear runtime logs so the next seeded run starts clean."""
+        cls._shutdown(simulation_id)
+        result = SimulationRunner.cleanup_simulation_logs(simulation_id)
+        if result and not result.get("success", False):
+            raise RuntimeError(f"Cannot isolate ensemble sample: {result.get('errors')}")
+
+    @classmethod
+    def _shutdown(cls, simulation_id: str) -> None:
+        """Close runtime processes while preserving the final sample evidence."""
         try:
             SimulationRunner.close_simulation_env(simulation_id, timeout=20)
         except Exception as exc:
@@ -129,17 +156,13 @@ class EnsembleRunner:
                 SimulationRunner.stop_simulation(simulation_id)
         except Exception as exc:
             logger.debug("stop_simulation during reset: %s", exc)
-        try:
-            SimulationRunner.cleanup_simulation_logs(simulation_id)
-        except Exception as exc:
-            logger.debug("cleanup_simulation_logs during reset: %s", exc)
 
     @staticmethod
     def _wait_for_completion(simulation_id: str, timeout: float) -> bool:
         start = time.time()
         while time.time() - start < timeout:
             state = SimulationRunner.get_run_state(simulation_id)
-            if state and state.runner_status in (RunnerStatus.COMPLETED, RunnerStatus.FAILED):
+            if state and state.runner_status in (RunnerStatus.COMPLETED, RunnerStatus.FAILED, RunnerStatus.STOPPED):
                 return state.runner_status == RunnerStatus.COMPLETED
             time.sleep(3)
         logger.warning("Ensemble run timed out after %ss for %s", timeout, simulation_id)
@@ -202,3 +225,4 @@ class EnsembleRunner:
                 json.dump(aggregate, handle, ensure_ascii=False, indent=2)
         except OSError as exc:
             logger.error("Failed to persist ensemble signal for %s: %s", simulation_id, exc)
+            raise

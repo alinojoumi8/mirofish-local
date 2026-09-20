@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import random
+import sqlite3
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -304,13 +305,15 @@ def inject_agent_forecast_memory(
     if BaseMessage is None or OpenAIBackendRole is None:
         return
     memory_mode = config.get("memory_mode") or config.get("forecast_memory_mode") or "practical"
-    if memory_mode in {"off", "none", "disabled"}:
+    economy_enabled = bool((config.get("economy") or {}).get("enabled", False))
+    if memory_mode in {"off", "none", "disabled"} and not economy_enabled:
         return
 
     agent_config = _agent_config(config, agent_id)
     forecast_context = _forecast_context(config)
-    memories = load_short_memory(simulation_dir).get(str(agent_id), [])[-4:]
-    summary = load_memory_summaries(simulation_dir).get(str(agent_id), {})
+    memories = [] if memory_mode in {"off", "none", "disabled"} else load_short_memory(simulation_dir).get(str(agent_id), [])[-4:]
+    summary = {} if memory_mode in {"off", "none", "disabled"} else load_memory_summaries(simulation_dir).get(str(agent_id), {})
+    economy_context = _economy_context(simulation_dir, agent_id) if economy_enabled else ""
     memory_lines = []
     for item in memories:
         content = item.get("content") or ""
@@ -335,6 +338,7 @@ def inject_agent_forecast_memory(
         f"Expected behavior: posts/hour={agent_config.get('posts_per_hour', 0.5)}, comments/hour={agent_config.get('comments_per_hour', 1.0)}, response delay={agent_config.get('response_delay_min', 5)}-{agent_config.get('response_delay_max', 60)} minutes.",
         "Longer memory summary: " + (summary.get("summary") or "No compacted summary yet."),
         "Short-term memory: " + (" | ".join(memory_lines) if memory_lines else "No recent actions yet."),
+        economy_context,
         f"Current event shock: {event_context}" if event_context else "",
         "Act only if you can add forecast signal. Avoid generic greetings or public-relations filler.",
     ]).strip()
@@ -344,6 +348,52 @@ def inject_agent_forecast_memory(
         agent.update_memory(message=message, role=OpenAIBackendRole.SYSTEM)
     except Exception:
         pass
+
+
+def _economy_context(simulation_dir: str, agent_id: int) -> str:
+    """Load the canonical wallet, jobs, and events for the next social action."""
+    db_path = os.path.join(simulation_dir, "economy.db")
+    if not os.path.isfile(db_path):
+        return ""
+    try:
+        with sqlite3.connect(db_path, timeout=2) as conn:
+            conn.row_factory = sqlite3.Row
+            identity = conn.execute(
+                "SELECT economic_agent_id FROM economic_agents WHERE oasis_agent_id=?",
+                (int(agent_id),),
+            ).fetchone()
+            if not identity:
+                return ""
+            economic_id = identity["economic_agent_id"]
+            balance = conn.execute(
+                """SELECT COALESCE(SUM(l.amount_cents), 0) AS balance
+                   FROM accounts a LEFT JOIN ledger_entries l ON l.account_id=a.account_id
+                   WHERE a.owner_agent_id=?""",
+                (economic_id,),
+            ).fetchone()["balance"]
+            jobs = conn.execute(
+                """SELECT title, status, wage_cents FROM jobs
+                   WHERE employer_id=? OR worker_id=? ORDER BY updated_tick DESC LIMIT 3""",
+                (economic_id, economic_id),
+            ).fetchall()
+            events = conn.execute(
+                """SELECT event_type, amount_cents FROM economy_events
+                   WHERE actor_id=? OR counterparty_id=? ORDER BY tick DESC, created_at DESC LIMIT 3""",
+                (economic_id, economic_id),
+            ).fetchall()
+        job_text = "; ".join(
+            f"{row['title']} ({row['status']}, {row['wage_cents']} cents)" for row in jobs
+        ) or "none"
+        event_text = "; ".join(
+            f"{row['event_type']} ({row['amount_cents']} cents)" for row in events
+        ) or "none"
+        return (
+            f"[Economic Twin] Canonical balance: {balance} cents. "
+            f"Your jobs: {job_text}. Recent economic events: {event_text}. "
+            "Keep social claims consistent with these settled facts."
+        )
+    except (OSError, sqlite3.Error, TypeError, ValueError):
+        return ""
 
 
 def _agent_config(config: Dict[str, Any], agent_id: int) -> Dict[str, Any]:

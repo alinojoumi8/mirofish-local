@@ -55,6 +55,7 @@
           :runtimeMode="runtimeMode"
           :ensembleRuns="ensembleRuns"
           :minutesPerRound="minutesPerRound"
+          :economySettings="economySettings"
           :projectData="projectData"
           :graphData="graphData"
           :systemLogs="systemLogs"
@@ -76,6 +77,7 @@ import GraphPanel from '../components/GraphPanel.vue'
 import Step3Simulation from '../components/Step3Simulation.vue'
 import { getProject, getGraphData } from '../api/graph'
 import { getSimulation, getSimulationConfig, stopSimulation, closeSimulationEnv, getEnvStatus } from '../api/simulation'
+import { economySettingsFromQuery } from '../utils/economySettings'
 
 const route = useRoute()
 const router = useRouter()
@@ -94,6 +96,7 @@ const currentSimulationId = ref(route.params.simulationId)
 const maxRounds = ref(route.query.maxRounds ? parseInt(route.query.maxRounds) : null)
 // Runtime mode ('realistic' default, 'fast' for cheap preview) from query param
 const runtimeMode = ref(route.query.runtimeMode === 'fast' ? 'fast' : 'realistic')
+const economySettings = ref(economySettingsFromQuery(route.query))
 const minutesPerRound = ref(30) // Default 30 minutes per round
 // Number of seeded ensemble runs configured in Step 2 (>1 enables the ensemble action)
 const ensembleRuns = ref(1)
@@ -311,6 +314,7 @@ onMounted(() => {
   if (maxRounds.value) {
     addLog(`Custom simulation rounds: ${maxRounds.value}`)
   }
+  addLog(`Economic twin ${economySettings.value.enabled ? 'enabled' : 'disabled'}`)
   
   loadSimulationData()
 })

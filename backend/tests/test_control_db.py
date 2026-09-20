@@ -147,3 +147,28 @@ def test_failed_legacy_import_can_be_retried_after_source_is_repaired(tmp_path):
 
     assert result["projects"] == 1
     assert database.get_project("proj_broken")["name"] == "Repaired"
+
+
+def test_database_operations_close_connections(tmp_path, monkeypatch):
+    import sqlite3
+    import pytest
+
+    database = ControlDatabase(tmp_path / "control.db")
+    connections = []
+    original_connect = database._connect
+
+    def track_connection():
+        connection = original_connect()
+        connections.append(connection)
+        return connection
+
+    monkeypatch.setattr(database, "_connect", track_connection)
+    database.put_project({"project_id": "proj_1"})
+    assert database.get_project("proj_1")["project_id"] == "proj_1"
+    assert len(database.list_projects()) == 1
+    assert database.health_status()["healthy"]
+    database.migration_state()
+    database.delete_project("proj_1")
+    for connection in connections:
+        with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+            connection.execute("SELECT 1")

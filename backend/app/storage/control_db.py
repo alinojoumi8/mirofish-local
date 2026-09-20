@@ -11,6 +11,7 @@ import json
 import logging
 import sqlite3
 import threading
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
@@ -48,8 +49,17 @@ class ControlDatabase:
         connection.execute("PRAGMA journal_mode = WAL")
         return connection
 
+    @contextmanager
+    def _transaction(self):
+        connection = self._connect()
+        try:
+            with connection:
+                yield connection
+        finally:
+            connection.close()
+
     def _initialize(self) -> None:
-        with self._connect() as connection:
+        with self._transaction() as connection:
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -101,7 +111,7 @@ class ControlDatabase:
             if replace
             else "DO NOTHING"
         )
-        with self._connect() as connection:
+        with self._transaction() as connection:
             cursor = connection.execute(
                 f"""
                 INSERT INTO {table}(record_id, payload_json, created_at, updated_at)
@@ -113,7 +123,7 @@ class ControlDatabase:
             return cursor.rowcount > 0
 
     def _get(self, table: str, record_id: str) -> Optional[Dict[str, Any]]:
-        with self._connect() as connection:
+        with self._transaction() as connection:
             row = connection.execute(
                 f"SELECT payload_json FROM {table} WHERE record_id = ?",
                 (record_id,),
@@ -122,7 +132,7 @@ class ControlDatabase:
 
     def _list(self, table: str, limit: int = 50) -> list[Dict[str, Any]]:
         safe_limit = max(0, int(limit))
-        with self._connect() as connection:
+        with self._transaction() as connection:
             rows = connection.execute(
                 f"SELECT payload_json FROM {table} ORDER BY updated_at DESC LIMIT ?",
                 (safe_limit,),
@@ -130,7 +140,7 @@ class ControlDatabase:
         return [json.loads(row["payload_json"]) for row in rows]
 
     def _delete(self, table: str, record_id: str) -> bool:
-        with self._connect() as connection:
+        with self._transaction() as connection:
             cursor = connection.execute(
                 f"DELETE FROM {table} WHERE record_id = ?",
                 (record_id,),
@@ -223,6 +233,9 @@ class ControlDatabase:
     def get_simulation_run(self, simulation_id: str) -> Optional[Dict[str, Any]]:
         return self._get("simulation_runs", simulation_id)
 
+    def delete_simulation_run(self, simulation_id: str) -> bool:
+        return self._delete("simulation_runs", simulation_id)
+
     def list_simulation_runs(self, limit: int = 1000) -> list[Dict[str, Any]]:
         return self._list("simulation_runs", limit)
 
@@ -236,7 +249,7 @@ class ControlDatabase:
         migration_name = "legacy_json_v1"
         counts = {"projects": 0, "cases": 0, "simulation_runs": 0}
         with self._migration_lock:
-            with self._connect() as connection:
+            with self._transaction() as connection:
                 applied = connection.execute(
                     "SELECT 1 FROM schema_migrations WHERE name = ?",
                     (migration_name,),
@@ -259,7 +272,7 @@ class ControlDatabase:
                     raise RuntimeError(f"Legacy metadata is not an object: {path}")
                 loaded.append((table, payload))
 
-            with self._connect() as connection:
+            with self._transaction() as connection:
                 for table, payload in loaded:
                     id_field = _TABLE_IDS[table]
                     record_id = str(payload.get(id_field) or "")
@@ -285,7 +298,7 @@ class ControlDatabase:
         return counts
 
     def migration_state(self) -> Dict[str, Any]:
-        with self._connect() as connection:
+        with self._transaction() as connection:
             rows = connection.execute(
                 "SELECT name, version, applied_at, details_json FROM schema_migrations ORDER BY applied_at"
             ).fetchall()
@@ -300,7 +313,7 @@ class ControlDatabase:
 
     def health_status(self) -> Dict[str, Any]:
         try:
-            with self._connect() as connection:
+            with self._transaction() as connection:
                 connection.execute("SELECT 1").fetchone()
                 journal_mode = connection.execute("PRAGMA journal_mode").fetchone()[0]
                 schema = connection.execute(

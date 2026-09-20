@@ -8,7 +8,7 @@
     "build": "vite build",
     "preview": "vite preview",
     "test": "npm run test:unit && npm run test:components",
-    "test:unit": "node --test src/api/*.test.js src/router/*.test.js src/utils/*.test.js",
+    "test:unit": "node --test src/api/*.test.js src/router/*.test.js src/utils/*.test.js tests/*.test.js",
     "test:components": "vitest run"
   },
   "dependencies": {
@@ -22,6 +22,9 @@
     "@vue/test-utils": "^2.4.11",
     "jsdom": "^29.1.1",
     "vite": "^7.3.6",
-    "vitest": "^4.1.10"
+    "vitest": "^4.1.11"
+  },
+  "engines": {
+    "node": "^20.19.0 || ^22.13.0 || >=24.0.0"
   }
 }

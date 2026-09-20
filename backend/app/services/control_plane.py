@@ -37,9 +37,7 @@ def initialize_control_plane(app, logger, *, log_startup: bool) -> None:
             )
     except Exception as exc:
         logger.error("Control database initialization failed: %s", exc)
-        app.extensions["control_db"] = None
-        app.extensions["control_db_migration"] = {"error": str(exc)}
-        _configure_repositories(None)
+        raise RuntimeError("Control database initialization failed") from exc
 
 
 def initialize_simulation_runtime(app, logger, *, log_startup: bool) -> Dict[str, int]:

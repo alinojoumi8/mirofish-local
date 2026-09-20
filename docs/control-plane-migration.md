@@ -48,8 +48,8 @@ Application logs also record the database path and import counts at startup.
 
 A malformed or unreadable legacy record prevents the migration marker from
 being written. The app logs the exact file, leaves every source record intact,
-and uses filesystem persistence for that process. Repair or restore the named
-JSON file and restart; the complete import will retry.
+and stops startup to prevent reads or writes against a stale filesystem snapshot.
+Repair or restore the named JSON file and restart; the complete import will retry.
 
 Do not delete legacy files immediately after migrating. They are a migration
 snapshot, but they do not receive later project/case/task updates and therefore

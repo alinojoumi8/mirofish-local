@@ -322,6 +322,54 @@
       </div>
     </div>
 
+    <div v-if="economySummary" class="economy-panel">
+      <div class="diagnostics-header">
+        <span class="diagnostics-title">Economic Twin</span>
+        <span class="diagnostics-badge">{{ economySummary.status || 'ready' }}</span>
+      </div>
+      <div class="diagnostics-grid economy-grid">
+        <div class="diagnostic-metric">
+          <span class="metric-value mono">{{ formatCurrency(economyMetrics.total_supply_cents) }}</span>
+          <span class="metric-label">Agent Supply</span>
+        </div>
+        <div class="diagnostic-metric">
+          <span class="metric-value mono">{{ economyMetrics.employed_count || 0 }} / {{ economyMetrics.open_jobs || 0 }}</span>
+          <span class="metric-label">Employed / Open Jobs</span>
+        </div>
+        <div class="diagnostic-metric">
+          <span class="metric-value mono">{{ formatCurrency(economyMetrics.trade_volume_cents) }}</span>
+          <span class="metric-label">Latest Tick Volume</span>
+        </div>
+        <div class="diagnostic-metric">
+          <span class="metric-value mono">{{ economyMetrics.gini ?? '0.000' }}</span>
+          <span class="metric-label">Gini</span>
+        </div>
+        <div class="diagnostic-metric">
+          <span class="metric-value mono">{{ economySummary.rejected_intents || 0 }}</span>
+          <span class="metric-label">Rejected Intents</span>
+        </div>
+        <div class="diagnostic-metric">
+          <span class="metric-value mono">{{ economySummary.ticks?.running || 0 }}</span>
+          <span class="metric-label">Running Ticks</span>
+        </div>
+        <div class="diagnostic-metric">
+          <span class="metric-value mono">{{ economySummary.ticks?.failed || 0 }}</span>
+          <span class="metric-label">Failed Ticks</span>
+        </div>
+      </div>
+      <div v-if="economySummary.latest_tick?.error" class="economy-error">
+        <strong>Latest tick error:</strong> {{ economySummary.latest_tick.error }}
+      </div>
+      <div class="economy-events">
+        <span class="list-title">Settled events</span>
+        <div v-for="event in economyEvents.slice(0, 4)" :key="event.event_id" class="list-row economy-event-row">
+          <span><strong>{{ event.event_type }}</strong> · {{ event.actor_name || 'system' }}<template v-if="event.counterparty_name"> → {{ event.counterparty_name }}</template></span>
+          <span class="mono">{{ event.amount_cents ? formatCurrency(event.amount_cents) : `T${event.tick}` }}</span>
+        </div>
+        <div v-if="!economyEvents.length" class="list-empty">Wallets initialized; waiting for the first daily economic tick.</div>
+      </div>
+    </div>
+
     <div v-if="diagnostics" class="diagnostics-panel">
       <div class="diagnostics-header">
         <span class="diagnostics-title">Agent Diagnostics</span>
@@ -404,13 +452,23 @@ import {
   getRunDiagnostics,
   runEnsemble,
   getEnsembleStatus,
-  getDiagnosticsExportUrl
+  getDiagnosticsExportUrl,
+  getEconomySummary,
+  getEconomyEvents
 } from '../api/simulation'
 import { generateReport } from '../api/report'
+import {
+  DEFAULT_ECONOMY_SETTINGS,
+  normalizeEconomySettings
+} from '../utils/economySettings'
 
 const props = defineProps({
   simulationId: String,
   maxRounds: Number, // Max rounds passed from Step2
+  economySettings: {
+    type: Object,
+    default: () => ({ ...DEFAULT_ECONOMY_SETTINGS })
+  },
   minutesPerRound: {
     type: Number,
     default: 30 // Default: 30 minutes per round
@@ -445,6 +503,8 @@ const isStopping = ref(false)
 const startError = ref(null)
 const runStatus = ref({})
 const diagnostics = ref(null)
+const economySummary = ref(null)
+const economyEvents = ref([])
 const allActions = ref([]) // All actions (incremental accumulation)
 const actionIds = ref(new Set()) // Action IDs set for deduplication
 const scrollContainer = ref(null)
@@ -475,6 +535,21 @@ const redditActionsCount = computed(() => {
 })
 
 const runTiming = computed(() => runStatus.value.timing?.run || null)
+const economyMetrics = computed(() => economySummary.value?.latest_metrics || {})
+
+const formatCurrency = (cents) => {
+  const currency = economySummary.value?.settings?.currency || 'USD'
+  const amount = (Number(cents) || 0) / 100
+  try {
+    return new Intl.NumberFormat('en-US', {
+      style: 'currency',
+      currency,
+      maximumFractionDigits: 0
+    }).format(amount)
+  } catch {
+    return `${amount.toLocaleString('en-US')} ${currency}`
+  }
+}
 
 const formatWallDuration = (seconds) => {
   if (seconds === null || seconds === undefined || Number.isNaN(Number(seconds))) return '--'
@@ -540,6 +615,8 @@ const resetAllState = () => {
   phase.value = 0
   runStatus.value = {}
   diagnostics.value = null
+  economySummary.value = null
+  economyEvents.value = []
   allActions.value = []
   actionIds.value = new Set()
   prevTwitterRound.value = 0
@@ -569,6 +646,7 @@ const doStartSimulation = async () => {
 
   try {
     const realistic = props.runtimeMode !== 'fast'
+    const economy = normalizeEconomySettings(props.economySettings)
     const params = {
       simulation_id: props.simulationId,
       platform: 'parallel',
@@ -578,7 +656,8 @@ const doStartSimulation = async () => {
       enable_graph_memory_update: realistic,
       scenario_id: 'baseline',
       seed: Date.now() % 1000000,
-      memory_mode: realistic ? 'practical' : 'off'
+      memory_mode: realistic ? 'practical' : 'off',
+      economy
     }
 
     if (props.maxRounds) {
@@ -589,6 +668,11 @@ const doStartSimulation = async () => {
     addLog(realistic
       ? 'Realistic runtime mode: per-round forecast/stance grounding and live graph updates enabled'
       : 'Fast preview mode: forecast memory and live graph updates disabled')
+    addLog(
+      economy.enabled
+        ? 'Economic twin enabled: shared identities, synchronized decisions, and balanced settlement'
+        : 'Economic twin disabled for this run'
+    )
 
     const res = await startSimulation(params)
 
@@ -604,6 +688,7 @@ const doStartSimulation = async () => {
 
       startStatusPolling()
       startDetailPolling()
+      if (economy.enabled) startEconomyPolling()
     } else {
       startError.value = res.error || 'Start failed'
       addLog(`✗ Start failed: ${res.error || 'Unknown error'}`)
@@ -687,6 +772,8 @@ const doRunEnsemble = async () => {
     const res = await runEnsemble({
       simulation_id: props.simulationId,
       runs: props.ensembleRuns,
+      max_rounds: props.maxRounds || undefined,
+      economy: normalizeEconomySettings(props.economySettings),
       enable_graph_memory_update: props.runtimeMode !== 'fast'
     })
 
@@ -761,6 +848,7 @@ const formatSigned = (value) => {
 // Polling status
 let statusTimer = null
 let detailTimer = null
+let economyTimer = null
 
 const startStatusPolling = () => {
   statusTimer = setInterval(fetchRunStatus, 2000)
@@ -768,6 +856,11 @@ const startStatusPolling = () => {
 
 const startDetailPolling = () => {
   detailTimer = setInterval(fetchRunStatusDetail, 3000)
+}
+
+const startEconomyPolling = () => {
+  loadEconomy()
+  economyTimer = setInterval(loadEconomy, 5000)
 }
 
 const stopPolling = () => {
@@ -778,6 +871,10 @@ const stopPolling = () => {
   if (detailTimer) {
     clearInterval(detailTimer)
     detailTimer = null
+  }
+  if (economyTimer) {
+    clearInterval(economyTimer)
+    economyTimer = null
   }
 }
 
@@ -821,12 +918,27 @@ const fetchRunStatus = async () => {
         addLog('✓ Simulation completed')
         phase.value = 2
         stopPolling()
+        loadEconomy()
         loadDiagnostics()
         emit('update-status', 'completed')
       }
     }
   } catch (err) {
     console.warn('Failed to fetch run status:', err)
+  }
+}
+
+const loadEconomy = async () => {
+  if (!props.simulationId || !props.economySettings?.enabled) return
+  try {
+    const [summaryRes, eventsRes] = await Promise.all([
+      getEconomySummary(props.simulationId),
+      getEconomyEvents(props.simulationId, { limit: 8 })
+    ])
+    if (summaryRes.success && summaryRes.data) economySummary.value = summaryRes.data
+    if (eventsRes.success && eventsRes.data) economyEvents.value = eventsRes.data.events || []
+  } catch (err) {
+    if (err?.response?.status !== 404) console.warn('Failed to fetch economic twin:', err)
   }
 }
 
@@ -1268,6 +1380,41 @@ onUnmounted(() => {
   border-top: 1px solid #EAEAEA;
   background: #FFFFFF;
   padding: 12px 24px;
+}
+
+.economy-panel {
+  border-top: 1px solid #DDE7E3;
+  background: #F7FBF9;
+  padding: 12px 24px;
+}
+
+.economy-grid .diagnostic-metric {
+  background: #FFFFFF;
+  border-color: #D7E7DF;
+}
+
+.economy-events {
+  margin-top: 8px;
+  border: 1px solid #D7E7DF;
+  border-radius: 4px;
+  padding: 8px;
+  background: #FFFFFF;
+}
+
+.economy-error {
+  margin-top: 8px;
+  border: 1px solid #FECACA;
+  border-radius: 4px;
+  padding: 8px 10px;
+  color: #991B1B;
+  background: #FEF2F2;
+  font-size: 11px;
+}
+
+.economy-event-row strong {
+  text-transform: uppercase;
+  font-size: 10px;
+  color: #047857;
 }
 
 .diagnostics-header {

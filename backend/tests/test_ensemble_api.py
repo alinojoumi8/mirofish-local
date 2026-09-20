@@ -109,3 +109,23 @@ def test_ensemble_status_requires_identifier(client):
     resp = client.post("/api/simulation/run-ensemble/status", json={})
     assert resp.status_code == 400
     assert resp.get_json()["success"] is False
+
+
+def test_ensemble_forwards_economy_and_round_cap(client, monkeypatch):
+    import threading
+    monkeypatch.setattr(simulation_api, "_check_simulation_prepared", lambda sid: (True, {}))
+    calls = {}
+    finished = threading.Event()
+    def run(simulation_id, **kwargs):
+        calls.update(kwargs)
+        finished.set()
+        return {"completed_runs": 1}
+    monkeypatch.setattr(ensemble_runner_module.EnsembleRunner, "run_ensemble", staticmethod(run))
+    response = client.post("/api/simulation/run-ensemble", json={
+        "simulation_id": "sim_options", "runs": 2, "max_rounds": 17,
+        "economy": {"enabled": True}, "enable_graph_memory_update": False,
+    })
+    assert response.status_code == 200
+    assert finished.wait(2)
+    assert calls["max_rounds"] == 17
+    assert calls["economy"] == {"enabled": True}

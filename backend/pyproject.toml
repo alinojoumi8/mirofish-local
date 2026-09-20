@@ -15,6 +15,7 @@ dependencies = [
     
     # LLM 相关
     "openai>=1.0.0",
+    "requests>=2.31.0",
     
     # Neo4j graph database driver
     "neo4j>=5.15.0",
@@ -32,7 +33,6 @@ dependencies = [
     # 工具库
     "python-dotenv>=1.0.0",
     "pydantic>=2.0.0",
-    "requests>=2.28.0",
 ]
 
 [project.optional-dependencies]

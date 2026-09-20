@@ -618,6 +618,13 @@ Function Flow:
 
 [Important] This feature requires the OASIS simulation environment to be running!"""
 
+TOOL_DESC_ECONOMY_EVIDENCE = """\
+[Economic Twin Evidence - Settled State]
+Read the simulation's canonical economic identities, balances, jobs, events, and
+double-entry transactions. Use this when a report makes claims about money,
+employment, trade, inequality, or agent incentives. Ledger facts are settled
+simulation evidence and should take precedence over unverified social claims."""
+
 # ── Outline Planning Prompt ──
 
 PLAN_SYSTEM_PROMPT = """\
@@ -1005,6 +1012,11 @@ class ReportAgent:
         self.disable_interviews = disable_interviews
         self.strict_antirepetition = strict_antirepetition
         self.simulation_config = load_simulation_config(simulation_id)
+        self._economy_evidence_loaded = False
+        self._economy_evidence_context = ""
+        self._economy_evidence_warning = ""
+        self._economy_evidence_ledger: List[str] = []
+        self._economy_evidence_cards: List[Dict[str, Any]] = []
         self.forecast_settings = normalize_forecast_settings(
             self.simulation_config,
             simulation_requirement=simulation_requirement,
@@ -1039,6 +1051,92 @@ class ReportAgent:
         self.console_logger: Optional[ReportConsoleLogger] = None
 
         logger.info(f"ReportAgent initialization complete: graph_id={graph_id}, simulation_id={simulation_id}")
+
+    def _economy_is_enabled(self) -> bool:
+        enabled = (self.simulation_config.get("economy") or {}).get("enabled", False)
+        if isinstance(enabled, str):
+            return enabled.strip().lower() in {"true", "1", "yes", "on"}
+        return bool(enabled)
+
+    def _prefetch_economy_evidence(self) -> str:
+        """Load one bounded settled snapshot for every report prompt."""
+        if self._economy_evidence_loaded:
+            return self._economy_evidence_context
+        self._economy_evidence_loaded = True
+        if not self._economy_is_enabled():
+            return ""
+
+        try:
+            from .economy import economy_evidence
+
+            snapshot = economy_evidence(self.simulation_id, limit=25)
+        except Exception as exc:
+            self._economy_evidence_warning = (
+                "The economic twin is enabled, but settled economic evidence is unavailable: "
+                f"{exc}. Do not infer or fabricate balances, jobs, trades, prices, or economic outcomes."
+            )
+            self._economy_evidence_context = (
+                "[Economic Evidence Warning]\n" + self._economy_evidence_warning
+            )
+            self._economy_evidence_ledger = [
+                f"[economy_evidence warning] {self._economy_evidence_warning}"
+            ]
+            logger.warning(self._economy_evidence_warning)
+            return self._economy_evidence_context
+
+        summary = snapshot.get("summary") or {}
+        metrics = summary.get("latest_metrics") or {}
+        ticks = summary.get("ticks") or {}
+        latest_tick = summary.get("latest_tick") or {}
+        currency = (summary.get("settings") or {}).get("currency", "USD")
+        facts = [
+            (
+                f"The economic ledger contains {ticks.get('completed', 0)} completed, "
+                f"{ticks.get('running', 0)} running, and {ticks.get('failed', 0)} failed ticks; "
+                f"the latest tick is {latest_tick.get('tick', 'none')} with status "
+                f"{latest_tick.get('status', 'not started')}."
+            ),
+            (
+                f"The latest economic metrics snapshot at tick {metrics.get('tick', 0)} records "
+                f"{metrics.get('agents_count', 0)} agents, total supply "
+                f"{metrics.get('total_supply_cents', 0)} {currency} cents, trade volume "
+                f"{metrics.get('trade_volume_cents', 0)} cents, and Gini "
+                f"{metrics.get('gini', 0)}."
+            ),
+            f"Provider and validation checks recorded {summary.get('rejected_intents', 0)} rejected economic intents.",
+        ]
+        for agent in (snapshot.get("agents") or [])[:5]:
+            facts.append(
+                f"Economic agent {agent.get('name') or agent.get('economic_agent_id')} has a recorded balance of "
+                f"{agent.get('balance_cents', 0)} {currency} cents."
+            )
+        for event in (snapshot.get("events") or [])[:5]:
+            facts.append(
+                f"At tick {event.get('tick', 0)}, the ledger recorded {event.get('event_type', 'an event')} "
+                f"for {event.get('actor_name') or event.get('actor_id') or 'the system'} with amount "
+                f"{event.get('amount_cents', 0)} cents."
+            )
+
+        self._economy_evidence_ledger = [f"[economy_evidence] {fact}" for fact in facts]
+        self._economy_evidence_cards = [
+            {
+                "fact": fact,
+                "normalized_fact": ReportManager._normalize_fact(fact),
+                "tool_name": "economy_evidence",
+                "query": "automatic settled snapshot",
+                "section_title": "report-wide",
+                "usage": "prefetched",
+            }
+            for fact in facts
+        ]
+        self._economy_evidence_context = (
+            "[Auto-prefetched Settled Economic Evidence]\n"
+            + "\n".join(f"- {fact}" for fact in facts)
+            + "\n\nBounded source snapshot (economy_evidence):\n"
+            + json.dumps(snapshot, ensure_ascii=False, separators=(",", ":"))
+            + "\nUse only this settled snapshot or explicit economy_evidence tool results for economic claims."
+        )
+        return self._economy_evidence_context
 
     def _report_mode_guidance(self) -> str:
         forecast_lines = [
@@ -1103,6 +1201,13 @@ class ReportAgent:
                 "parameters": {
                     "interview_topic": "Interview topic or requirement description (e.g. 'understand students' views on the dorm formaldehyde incident')",
                     "max_agents": "Maximum number of agents to interview (optional, default 5, max 10)"
+                }
+            },
+            "economy_evidence": {
+                "name": "economy_evidence",
+                "description": TOOL_DESC_ECONOMY_EVIDENCE,
+                "parameters": {
+                    "limit": "Maximum recent agents, jobs, events, and transactions to return (default 25, max 100)"
                 }
             }
         }
@@ -1180,6 +1285,15 @@ class ReportAgent:
                     max_agents=max_agents
                 )
                 return result.to_text()
+
+            elif tool_name == "economy_evidence":
+                from .economy import economy_evidence
+
+                limit = parameters.get("limit", 25)
+                if isinstance(limit, str):
+                    limit = int(limit)
+                result = economy_evidence(self.simulation_id, limit=min(max(int(limit), 1), 100))
+                return json.dumps(result, ensure_ascii=False, indent=2)
             
             # ========== Backward Compatibility: Old Tools (Internal Redirect to New Tools) ==========
 
@@ -1216,14 +1330,14 @@ class ReportAgent:
                 return json.dumps(result, ensure_ascii=False, indent=2)
             
             else:
-                return f"Unknown tool: {tool_name}. Please use one of the following tools: insight_forge, panorama_search, quick_search"
+                return f"Unknown tool: {tool_name}. Please use one of the following tools: insight_forge, panorama_search, quick_search, interview_agents, economy_evidence"
 
         except Exception as e:
             logger.error(f"Tool execution failed: {tool_name}, error: {str(e)}")
             return f"Tool execution failed: {str(e)}"
     
     # Valid tool names set, used for validation when parsing raw JSON fallback
-    VALID_TOOL_NAMES = {"insight_forge", "panorama_search", "quick_search", "interview_agents"}
+    VALID_TOOL_NAMES = {"insight_forge", "panorama_search", "quick_search", "interview_agents", "economy_evidence"}
 
     def _parse_tool_calls(self, response: str) -> List[Dict[str, Any]]:
         """
@@ -1333,6 +1447,12 @@ class ReportAgent:
             total_entities=context.get('total_entities', 0),
             related_facts_json=json.dumps(context.get('related_facts', [])[:10], ensure_ascii=False, indent=2),
         )
+        economy_context = self._prefetch_economy_evidence()
+        if economy_context:
+            user_prompt += (
+                "\n\n" + economy_context
+                + "\nPlan economic analysis only where this evidence supports it."
+            )
 
         try:
             response = self.llm.chat_json(
@@ -1454,13 +1574,18 @@ class ReportAgent:
 
     def _build_used_evidence_ledger(self, previous_sections: List[str], max_items: int = 12) -> str:
         """Extract reused-risk facts from completed sections for prompt-level de-duplication."""
-        if not previous_sections:
+        self._prefetch_economy_evidence()
+        if not previous_sections and not self._economy_evidence_ledger:
             return "(No prior evidence used yet.)"
         if self.strict_antirepetition:
             max_items = max(max_items, 24)
 
-        evidence: List[str] = []
-        seen = set()
+        evidence: List[str] = list(self._economy_evidence_ledger)
+        seen = {
+            ReportManager._normalize_fact(item)
+            for item in self._economy_evidence_ledger
+            if ReportManager._normalize_fact(item)
+        }
         combined = "\n".join(previous_sections)
         quoted = re.findall(r'>\s*"([^"]{20,220})"', combined)
         candidates = quoted + ReportManager._extract_report_sentences(combined)
@@ -1540,6 +1665,12 @@ class ReportAgent:
             used_evidence_ledger=self._build_used_evidence_ledger(previous_sections),
             section_title=section.title,
         )
+        economy_context = self._prefetch_economy_evidence()
+        if economy_context:
+            user_prompt += (
+                "\n\n" + economy_context
+                + "\nDo not make economic claims beyond the evidence above. The economy_evidence tool remains available for deeper queries."
+            )
 
         messages = [
             {"role": "system", "content": system_prompt},
@@ -1556,8 +1687,14 @@ class ReportAgent:
 
         # Report context for InsightForge sub-question generation
         report_context = f"Section Title: {section.title}\nSimulation Requirement: {self.simulation_requirement}"
-        evidence_cards: List[Dict[str, Any]] = []
-        evidence_seen = set()
+        evidence_cards: List[Dict[str, Any]] = [
+            {**card, "section_title": section.title}
+            for card in self._economy_evidence_cards
+        ]
+        evidence_seen = {
+            card.get("normalized_fact") for card in evidence_cards if card.get("normalized_fact")
+        }
+        section.evidence_cards = evidence_cards
         
         for iteration in range(max_iterations):
             if progress_callback:
@@ -1908,6 +2045,11 @@ class ReportAgent:
                     progress_callback=lambda stage, prog, msg:
                         progress_callback(stage, prog // 5, msg) if progress_callback else None
                 )
+            if self._economy_evidence_warning:
+                outline.summary = (
+                    f"Economic evidence warning: {self._economy_evidence_warning} "
+                    f"{outline.summary or ''}"
+                ).strip()
             self.phase_timings["outline_seconds"] = timing.snapshot()["phase_totals"].get("outline", 0.0)
             report.outline = outline
             

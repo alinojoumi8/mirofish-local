@@ -161,3 +161,16 @@ def test_ensemble_aggregate_mean_and_spread():
     assert len(agg["mean_probabilities"]) == 3
     assert abs(sum(agg["mean_probabilities"]) - 1.0) < 1e-3
     assert agg["total_actions"] == 30
+
+
+def test_partial_ensemble_does_not_overstate_confidence_or_sample_count(monkeypatch):
+    synth = ForecastSynthesizer('partial', {})
+    monkeypatch.setattr(synth, 'build_simulation_signal', lambda: None)
+    monkeypatch.setattr(synth, '_load_ensemble_signal', lambda: {
+        'runs': 5, 'completed_runs': 1,
+        'mean_probabilities': [0.3, 0.4, 0.3],
+        'probability_std': [0, 0, 0], 'mean_net': 0, 'total_actions': 3,
+    })
+    result = synth.synthesize('')
+    assert result['confidence'] == 'low'
+    assert '1 completed seeded simulation runs' in result['limitations']

@@ -194,7 +194,8 @@ class LLMClient:
         self,
         messages: List[Dict[str, str]],
         temperature: float = 0.3,
-        max_tokens: int = 4096
+        max_tokens: int = 4096,
+        disable_reasoning: bool = False,
     ) -> Dict[str, Any]:
         """
         Send chat request and return JSON
@@ -203,16 +204,45 @@ class LLMClient:
             messages: Message list
             temperature: Temperature parameter
             max_tokens: Max token count
+            disable_reasoning: Disable model thinking when Ollama JSON is required
 
         Returns:
             Parsed JSON object
         """
-        response = self.chat(
-            messages=messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            response_format={"type": "json_object"}
-        )
+        if disable_reasoning and self._is_ollama():
+            base_url = (self.base_url or "").rstrip("/")
+            if base_url.endswith("/v1"):
+                base_url = base_url[:-3]
+            options: Dict[str, Any] = {
+                "temperature": temperature,
+                "num_predict": max_tokens,
+            }
+            if self._num_ctx:
+                options["num_ctx"] = self._num_ctx
+            native_response = requests.post(
+                f"{base_url}/api/chat",
+                json={
+                    "model": self.model,
+                    "messages": messages,
+                    "stream": False,
+                    "think": False,
+                    "format": "json",
+                    "options": options,
+                },
+                timeout=self.timeout,
+            )
+            native_response.raise_for_status()
+            body = native_response.json()
+            response = (body.get("message") or {}).get("content", "")
+            if not isinstance(response, str) or not response.strip():
+                raise ValueError("Ollama returned no JSON content")
+        else:
+            response = self.chat(
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                response_format={"type": "json_object"}
+            )
         # Clean markdown code block markers
         cleaned_response = response.strip()
         cleaned_response = re.sub(r'^```(?:json)?\s*\n?', '', cleaned_response, flags=re.IGNORECASE)
