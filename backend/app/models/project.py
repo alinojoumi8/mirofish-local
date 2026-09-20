@@ -126,6 +126,11 @@ class ProjectManager:
 
     # Project storage root directory
     PROJECTS_DIR = os.path.join(Config.UPLOAD_FOLDER, 'projects')
+    _repository = None
+
+    @classmethod
+    def configure_repository(cls, repository) -> None:
+        cls._repository = repository
 
     @classmethod
     def _ensure_projects_dir(cls):
@@ -196,6 +201,10 @@ class ProjectManager:
     def save_project(cls, project: Project) -> None:
         """Save project metadata"""
         project.updated_at = datetime.now().isoformat()
+        if cls._repository is not None:
+            cls._repository.put_project(project.to_dict())
+            return
+
         meta_path = cls._get_project_meta_path(project.project_id)
 
         with open(meta_path, 'w', encoding='utf-8') as f:
@@ -212,8 +221,11 @@ class ProjectManager:
         Returns:
             Project object, or None if not found
         """
-        meta_path = cls._get_project_meta_path(project_id)
+        if cls._repository is not None:
+            data = cls._repository.get_project(project_id)
+            return Project.from_dict(data) if data else None
 
+        meta_path = cls._get_project_meta_path(project_id)
         if not os.path.exists(meta_path):
             return None
 
@@ -233,8 +245,10 @@ class ProjectManager:
         Returns:
             Project list, sorted by creation time (descending)
         """
-        cls._ensure_projects_dir()
+        if cls._repository is not None:
+            return [Project.from_dict(item) for item in cls._repository.list_projects(limit)]
 
+        cls._ensure_projects_dir()
         projects = []
         for project_id in os.listdir(cls.PROJECTS_DIR):
             project = cls.get_project(project_id)
@@ -257,10 +271,15 @@ class ProjectManager:
         Returns:
             Whether deletion succeeded
         """
-        project_dir = cls._get_project_dir(project_id)
+        repository_deleted = (
+            cls._repository.delete_project(project_id)
+            if cls._repository is not None
+            else False
+        )
 
+        project_dir = cls._get_project_dir(project_id)
         if not os.path.exists(project_dir):
-            return False
+            return repository_deleted
 
         shutil.rmtree(project_dir)
         return True

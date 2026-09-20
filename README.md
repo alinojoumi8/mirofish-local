@@ -24,7 +24,7 @@ The [original MiroFish](https://github.com/666ghj/MiroFish) was built for the Ch
 | Original MiroFish | MiroFish-Offline |
 |---|---|
 | Chinese UI | **English UI** (1,000+ strings translated) |
-| Zep Cloud (graph memory) | **Neo4j Community Edition 5.15** |
+| Zep Cloud (graph memory) | **Neo4j Community Edition 5.18** |
 | DashScope / OpenAI API (LLM) | **Ollama** (qwen2.5, llama3, etc.) |
 | Zep Cloud embeddings | **nomic-embed-text** via Ollama |
 | Cloud API keys required | **Zero cloud dependencies** |
@@ -57,7 +57,10 @@ git clone https://github.com/nikmcfly/MiroFish-Offline.git
 cd MiroFish-Offline
 cp .env.example .env
 
-# Start all services (Neo4j, Ollama, MiroFish)
+# Generate a password, then paste it into NEO4J_PASSWORD= in .env
+openssl rand -hex 24
+
+# Start all services in CPU-compatible mode
 docker compose up -d
 
 # Pull the required models into Ollama
@@ -67,15 +70,22 @@ docker exec mirofish-ollama ollama pull nomic-embed-text
 
 Open `http://localhost:3000` — that's it.
 
+All published ports bind to loopback. To opt into NVIDIA GPU acceleration,
+start the same stack with the GPU override:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
+```
+
 ### Option B: Manual
 
 **1. Start Neo4j**
 
 ```bash
 docker run -d --name neo4j \
-  -p 7474:7474 -p 7687:7687 \
-  -e NEO4J_AUTH=neo4j/mirofish \
-  neo4j:5.15-community
+  -p 127.0.0.1:7474:7474 -p 127.0.0.1:7687:7687 \
+  -e NEO4J_AUTH=neo4j/replace-with-a-unique-password \
+  neo4j:5.18-community
 ```
 
 **2. Start Ollama & pull models**
@@ -90,11 +100,11 @@ ollama pull nomic-embed-text  # Embeddings (768d)
 
 ```bash
 cp .env.example .env
-# Edit .env if your Neo4j/Ollama are on non-default ports
+# Set NEO4J_PASSWORD and edit endpoints if services use non-default ports
 
 cd backend
-pip install -r requirements.txt
-python run.py
+uv sync --dev
+uv run python run.py
 ```
 
 **4. Run frontend**
@@ -120,19 +130,30 @@ LLM_MODEL_NAME=qwen2.5:32b
 # Neo4j
 NEO4J_URI=bolt://localhost:7687
 NEO4J_USER=neo4j
-NEO4J_PASSWORD=mirofish
+NEO4J_PASSWORD=<unique-local-password>
 
 # Embeddings
 EMBEDDING_PROVIDER=ollama
 EMBEDDING_MODEL=nomic-embed-text
 EMBEDDING_BASE_URL=http://localhost:11434
 EMBEDDING_DIMENSIONS=768
+
+# External market lookups are disabled unless explicitly enabled
+MARKET_DATA_PROVIDER=none
 ```
 
 Works with any OpenAI-compatible API — swap Ollama for Claude, GPT, or any other provider by changing `LLM_BASE_URL` and `LLM_API_KEY`.
 Embeddings default to local Ollama. To benchmark Gemini, set `EMBEDDING_PROVIDER=gemini`, `GEMINI_API_KEY`, and `GEMINI_EMBEDDING_MODEL=gemini-embedding-2`; rebuild or re-embed graphs before searching with a different embedding provider.
 
-Runtime readiness is exposed at `GET /api/status`. It reports Neo4j health, LLM configuration, embedding health, and whether vector search is usable.
+Runtime readiness is exposed at `GET /api/status`. It reports Neo4j, embedding,
+SQLite control-plane, migration, and simulation-restart status. The lightweight
+container liveness endpoint is `GET /health`.
+
+Project, case, task, and simulation metadata is stored transactionally in
+`backend/uploads/mirofish.db`. Existing JSON metadata is imported once without
+being deleted; uploaded documents and generated artifacts remain on disk. See
+[`docs/control-plane-migration.md`](docs/control-plane-migration.md) for backup,
+migration, and recovery details.
 
 Run the embedding benchmark from `backend/`:
 
@@ -147,13 +168,14 @@ This fork introduces a clean abstraction layer between the application and the g
 ```
 ┌─────────────────────────────────────────┐
 │              Flask API                   │
-│  graph.py  simulation.py  report.py     │
+│ graph.py simulation.py diagnostics.py   │
+│ report.py market.py status.py           │
 └──────────────┬──────────────────────────┘
                │ app.extensions['neo4j_storage']
 ┌──────────────▼──────────────────────────┐
 │           Service Layer                  │
-│  EntityReader  GraphToolsService         │
-│  GraphMemoryUpdater  ReportAgent         │
+│ ControlPlane  SimulationRunner           │
+│ GraphBuilder  GraphTools  ReportAgent    │
 └──────────────┬──────────────────────────┘
                │ storage: GraphStorage
 ┌──────────────▼──────────────────────────┐
@@ -168,17 +190,18 @@ This fork introduces a clean abstraction layer between the application and the g
 │    │  └───────────────┘ │                │
 │    └───────────────────┘                │
 └─────────────────────────────────────────┘
-               │
-        ┌──────▼──────┐
-        │  Neo4j CE   │
-        │  5.15       │
-        └─────────────┘
+       │ graph/search          │ workflow metadata
+┌──────▼──────┐         ┌─────▼──────────────┐
+│ Neo4j 5.18 │         │ SQLite control DB  │
+└─────────────┘         └────────────────────┘
 ```
 
 **Key design decisions:**
 
 - `GraphStorage` is an abstract interface — swap Neo4j for any other graph DB by implementing one class
 - Dependency injection via Flask `app.extensions` — no global singletons
+- SQLite WAL transactions for restart-safe project, case, task, and run metadata
+- Uploaded files and large generated artifacts remain on the filesystem
 - Hybrid search: 0.7 × vector similarity + 0.3 × BM25 keyword search
 - Synchronous NER/RE extraction via local LLM (replaces Zep's async episodes)
 - All original dataclasses and LLM tools (InsightForge, Panorama, Agent Interviews) preserved
@@ -193,6 +216,18 @@ This fork introduces a clean abstraction layer between the application and the g
 | CPU | 4 cores | 8+ cores |
 
 CPU-only mode works but is significantly slower for LLM inference. For lighter setups, use `qwen2.5:14b` or `qwen2.5:7b`.
+
+## Development checks
+
+```bash
+npm test          # backend + frontend test suites
+npm run build     # production frontend bundle
+npm run check     # both of the above
+```
+
+Pull requests also run backend tests, frontend unit/component tests, the
+frontend build, a production dependency audit, Compose validation, and a Docker
+image build.
 
 ## Use Cases
 

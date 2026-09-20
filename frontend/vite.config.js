@@ -4,6 +4,10 @@ import vue from '@vitejs/plugin-vue'
 // https://vite.dev/config/
 export default defineConfig({
   plugins: [vue()],
+  test: {
+    environment: 'jsdom',
+    include: ['src/**/*.component.test.js']
+  },
   server: {
     port: 3000,
     open: false,

@@ -12,6 +12,7 @@ import threading
 import subprocess
 import signal
 import atexit
+import tempfile
 from collections import Counter, defaultdict
 from typing import Dict, Any, List, Optional, Union
 from dataclasses import dataclass, field
@@ -235,6 +236,11 @@ class SimulationRunner:
     _monitor_threads: Dict[str, threading.Thread] = {}
     _stdout_files: Dict[str, Any] = {}  # Store stdout file handles
     _stderr_files: Dict[str, Any] = {}  # Store stderr file handles
+    _repository = None
+
+    @classmethod
+    def configure_repository(cls, repository) -> None:
+        cls._repository = repository
     
     # Graph memory update configuration
     _graph_memory_enabled: Dict[str, bool] = {}  # simulation_id -> enabled
@@ -254,16 +260,29 @@ class SimulationRunner:
     @classmethod
     def _load_run_state(cls, simulation_id: str) -> Optional[SimulationRunState]:
         """Load run state from file"""
-        state_file = os.path.join(cls.RUN_STATE_DIR, simulation_id, "run_state.json")
-        if not os.path.exists(state_file):
-            return None
-        
         try:
-            with open(state_file, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            
-            state = SimulationRunState(
-                simulation_id=simulation_id,
+            data = (
+                cls._repository.get_simulation_run(simulation_id)
+                if cls._repository is not None
+                else None
+            )
+            if data is None:
+                state_file = os.path.join(cls.RUN_STATE_DIR, simulation_id, "run_state.json")
+                if not os.path.exists(state_file):
+                    return None
+                with open(state_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+
+            state = cls._state_from_dict(simulation_id, data)
+            return state
+        except Exception as e:
+            logger.error(f"Failed to load run state: {str(e)}")
+            return None
+
+    @classmethod
+    def _state_from_dict(cls, simulation_id: str, data: Dict[str, Any]) -> SimulationRunState:
+        state = SimulationRunState(
+                simulation_id=data.get("simulation_id") or simulation_id,
                 runner_status=RunnerStatus(data.get("runner_status", "idle")),
                 current_round=data.get("current_round", 0),
                 total_rounds=data.get("total_rounds", 0),
@@ -286,27 +305,21 @@ class SimulationRunner:
                 error=data.get("error"),
                 process_pid=data.get("process_pid"),
                 timing=data.get("timing", {}),
-            )
+        )
 
-            # Load recent actions
-            actions_data = data.get("recent_actions", [])
-            for a in actions_data:
-                state.recent_actions.append(AgentAction(
-                    round_num=a.get("round_num", 0),
-                    timestamp=a.get("timestamp", ""),
-                    platform=a.get("platform", ""),
-                    agent_id=a.get("agent_id", 0),
-                    agent_name=a.get("agent_name", ""),
-                    action_type=a.get("action_type", ""),
-                    action_args=a.get("action_args", {}),
-                    result=a.get("result"),
-                    success=a.get("success", True),
-                ))
-            
-            return state
-        except Exception as e:
-            logger.error(f"Failed to load run state: {str(e)}")
-            return None
+        for action_data in data.get("recent_actions", []):
+            state.recent_actions.append(AgentAction(
+                round_num=action_data.get("round_num", 0),
+                timestamp=action_data.get("timestamp", ""),
+                platform=action_data.get("platform", ""),
+                agent_id=action_data.get("agent_id", 0),
+                agent_name=action_data.get("agent_name", ""),
+                action_type=action_data.get("action_type", ""),
+                action_args=action_data.get("action_args", {}),
+                result=action_data.get("result"),
+                success=action_data.get("success", True),
+            ))
+        return state
     
     @classmethod
     def _save_run_state(cls, state: SimulationRunState):
@@ -316,11 +329,72 @@ class SimulationRunner:
         state_file = os.path.join(sim_dir, "run_state.json")
         
         data = state.to_detail_dict()
-        
-        with open(state_file, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+
+        if cls._repository is not None:
+            cls._repository.put_simulation_run(data)
+
+        # IPC and older installations still read this file. Write it atomically
+        # so a crash cannot leave a partially serialized compatibility mirror.
+        temp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode='w',
+                encoding='utf-8',
+                dir=sim_dir,
+                prefix='.run_state.',
+                suffix='.tmp',
+                delete=False,
+            ) as handle:
+                temp_path = handle.name
+                json.dump(data, handle, ensure_ascii=False, indent=2)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_path, state_file)
+        finally:
+            if temp_path and os.path.exists(temp_path):
+                os.unlink(temp_path)
         
         cls._run_states[state.simulation_id] = state
+
+    @classmethod
+    def reconcile_persisted_runs(cls) -> Dict[str, int]:
+        """Reconcile running metadata with recorded operating-system processes."""
+        result = {"checked": 0, "alive": 0, "interrupted": 0}
+        if cls._repository is None:
+            return result
+
+        for payload in cls._repository.list_simulation_runs():
+            if payload.get("runner_status") not in {
+                RunnerStatus.STARTING.value,
+                RunnerStatus.RUNNING.value,
+                RunnerStatus.PAUSED.value,
+                RunnerStatus.STOPPING.value,
+            }:
+                continue
+            result["checked"] += 1
+            pid = payload.get("process_pid")
+            alive = False
+            if pid:
+                try:
+                    os.kill(int(pid), 0)
+                    alive = True
+                except (OSError, TypeError, ValueError):
+                    alive = False
+            if alive:
+                result["alive"] += 1
+                continue
+
+            state = cls._state_from_dict(payload["simulation_id"], payload)
+            state.runner_status = RunnerStatus.STOPPED
+            state.twitter_running = False
+            state.reddit_running = False
+            state.process_pid = None
+            state.completed_at = datetime.now().isoformat()
+            state.updated_at = state.completed_at
+            state.error = "Simulation interrupted during backend restart; recorded process is no longer running"
+            cls._save_run_state(state)
+            result["interrupted"] += 1
+        return result
     
     @classmethod
     def start_simulation(

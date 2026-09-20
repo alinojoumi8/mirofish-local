@@ -10,7 +10,9 @@ import hashlib
 import json
 import os
 import re
+import threading
 import uuid
+from functools import wraps
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -20,6 +22,15 @@ from ..config import Config
 from ..utils.logger import get_logger
 
 logger = get_logger("mirofish.case")
+_CASE_MUTATION_LOCK = threading.RLock()
+
+
+def _serialized_case_mutation(function):
+    @wraps(function)
+    def wrapped(*args, **kwargs):
+        with _CASE_MUTATION_LOCK:
+            return function(*args, **kwargs)
+    return wrapped
 
 
 class DocumentType(str, Enum):
@@ -423,6 +434,11 @@ def build_prediction_snapshot(
 
 class CaseManager:
     CASES_DIR = os.path.join(Config.UPLOAD_FOLDER, "cases")
+    _repository = None
+
+    @classmethod
+    def configure_repository(cls, repository) -> None:
+        cls._repository = repository
 
     @classmethod
     def _ensure_cases_dir(cls) -> None:
@@ -437,6 +453,7 @@ class CaseManager:
         return os.path.join(cls._get_case_dir(case_id), "case.json")
 
     @classmethod
+    @_serialized_case_mutation
     def create_case(cls, name: str, simulation_requirement: str = "", tags: Optional[List[str]] = None) -> Case:
         cls._ensure_cases_dir()
         case_id = f"case_{uuid.uuid4().hex[:12]}"
@@ -457,12 +474,20 @@ class CaseManager:
     def save_case(cls, case: Case) -> None:
         cls._ensure_cases_dir()
         case.updated_at = _now()
+        if cls._repository is not None:
+            cls._repository.put_case(case.to_dict())
+            return
+
         os.makedirs(cls._get_case_dir(case.case_id), exist_ok=True)
         with open(cls._get_case_path(case.case_id), "w", encoding="utf-8") as f:
             json.dump(case.to_dict(), f, ensure_ascii=False, indent=2)
 
     @classmethod
     def get_case(cls, case_id: str) -> Optional[Case]:
+        if cls._repository is not None:
+            payload = cls._repository.get_case(case_id)
+            return Case.from_dict(payload) if payload else None
+
         path = cls._get_case_path(case_id)
         if not os.path.exists(path):
             return None
@@ -471,6 +496,9 @@ class CaseManager:
 
     @classmethod
     def list_cases(cls, limit: int = 50) -> List[Case]:
+        if cls._repository is not None:
+            return [Case.from_dict(item) for item in cls._repository.list_cases(limit)]
+
         cls._ensure_cases_dir()
         cases: List[Case] = []
         for case_id in os.listdir(cls.CASES_DIR):
@@ -481,6 +509,7 @@ class CaseManager:
         return cases[:limit]
 
     @classmethod
+    @_serialized_case_mutation
     def create_version(
         cls,
         case_id: str,
@@ -544,6 +573,7 @@ class CaseManager:
         return version
 
     @classmethod
+    @_serialized_case_mutation
     def update_version(cls, case_id: str, version_id: str, **updates: Any) -> Optional[CaseVersion]:
         case = cls.get_case(case_id)
         if not case:
@@ -594,6 +624,7 @@ class CaseManager:
         return None
 
     @classmethod
+    @_serialized_case_mutation
     def record_prediction_snapshot(
         cls,
         case_id: str,

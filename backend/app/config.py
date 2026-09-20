@@ -17,12 +17,21 @@ else:
     load_dotenv(override=True)
 
 
+def _csv_list(value: str) -> list[str]:
+    return [item.strip() for item in value.split(',') if item.strip()]
+
+
 class Config:
     """Flask configuration class"""
 
     # Flask configuration
-    SECRET_KEY = os.environ.get('SECRET_KEY', 'mirofish-secret-key')
-    DEBUG = os.environ.get('FLASK_DEBUG', 'True').lower() == 'true'
+    SECRET_KEY = os.environ.get('SECRET_KEY')
+    DEBUG = os.environ.get('FLASK_DEBUG', 'False').lower() == 'true'
+    CORS_ORIGINS = _csv_list(os.environ.get(
+        'CORS_ORIGINS',
+        'http://127.0.0.1:3000,http://localhost:3000',
+    ))
+    EXPOSE_INTERNAL_ERRORS = os.environ.get('EXPOSE_INTERNAL_ERRORS', 'False').lower() == 'true'
 
     # JSON configuration - disable ASCII escaping to display Chinese directly (not as \uXXXX)
     JSON_AS_ASCII = False
@@ -36,7 +45,7 @@ class Config:
     # Neo4j configuration
     NEO4J_URI = os.environ.get('NEO4J_URI', 'bolt://localhost:7687')
     NEO4J_USER = os.environ.get('NEO4J_USER', 'neo4j')
-    NEO4J_PASSWORD = os.environ.get('NEO4J_PASSWORD', 'mirofish')
+    NEO4J_PASSWORD = os.environ.get('NEO4J_PASSWORD')
 
     # Embedding configuration
     EMBEDDING_PROVIDER = os.environ.get('EMBEDDING_PROVIDER', 'ollama').strip().lower()
@@ -56,6 +65,10 @@ class Config:
     # File upload configuration
     MAX_CONTENT_LENGTH = 50 * 1024 * 1024  # 50MB
     UPLOAD_FOLDER = os.path.join(os.path.dirname(__file__), '../uploads')
+    CONTROL_DB_PATH = os.environ.get(
+        'CONTROL_DB_PATH',
+        os.path.join(UPLOAD_FOLDER, 'mirofish.db'),
+    )
     ALLOWED_EXTENSIONS = {'pdf', 'md', 'txt', 'markdown'}
 
     # Text processing configuration
@@ -82,8 +95,9 @@ class Config:
     )
 
     # Market data configuration (for macroeconomic / price forecasting)
-    # Provider: 'auto' (Yahoo for prices, FRED for indicators), or 'none' to stay fully offline.
-    MARKET_DATA_PROVIDER = os.environ.get('MARKET_DATA_PROVIDER', 'auto').strip().lower()
+    # External market lookups are opt-in so the default runtime remains offline.
+    # Set to 'auto' to use Yahoo for prices and FRED for indicators.
+    MARKET_DATA_PROVIDER = os.environ.get('MARKET_DATA_PROVIDER', 'none').strip().lower()
     FRED_API_KEY = os.environ.get('FRED_API_KEY', '')
     MARKET_DATA_CACHE_DIR = os.environ.get(
         'MARKET_DATA_CACHE_DIR',

@@ -1,5 +1,8 @@
 # MiroFish-Offline Migration Progress
 
+> Historical migration log. Some early file paths describe the initial fork
+> and have since moved. See `docs/architecture.md` for the current boundaries.
+
 ## Overview
 Migration from Zep Cloud + DashScope (Alibaba Qwen API) to local Neo4j CE + Ollama.
 

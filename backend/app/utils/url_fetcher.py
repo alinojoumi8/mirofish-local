@@ -13,13 +13,14 @@ import re
 import socket
 from html.parser import HTMLParser
 from typing import Dict, List, Optional
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import requests
 
 # Conservative caps for a user-initiated fetch.
 MAX_BYTES = 5 * 1024 * 1024  # 5 MB
 REQUEST_TIMEOUT = 20  # seconds
+MAX_REDIRECTS = 5
 USER_AGENT = "MiroFish-Offline/1.0 (+document ingestion)"
 
 # Tags whose inner content is never readable page text. (Not "head": <title> lives
@@ -126,22 +127,46 @@ def fetch_url(url: str) -> Dict[str, str]:
     Supports HTML (stripped to text), plain text / markdown, and PDF (via PyMuPDF).
     Raises ValueError on invalid/blocked URLs or empty content.
     """
-    parsed = urlparse(url)
-    if parsed.scheme.lower() not in {"http", "https"}:
-        raise ValueError(f"Only http/https URLs are supported: {url}")
-    _assert_public_host(parsed.hostname or "")
+    current_url = url
+    response = None
+    for redirect_count in range(MAX_REDIRECTS + 1):
+        parsed = urlparse(current_url)
+        if parsed.scheme.lower() not in {"http", "https"}:
+            raise ValueError(f"Only http/https URLs are supported: {current_url}")
+        _assert_public_host(parsed.hostname or "")
 
-    response = requests.get(
-        url,
-        timeout=REQUEST_TIMEOUT,
-        headers={"User-Agent": USER_AGENT, "Accept": "text/html,text/plain,application/pdf,*/*"},
-        stream=True,
-        allow_redirects=True,
-    )
+        response = requests.get(
+            current_url,
+            timeout=REQUEST_TIMEOUT,
+            headers={"User-Agent": USER_AGENT, "Accept": "text/html,text/plain,application/pdf,*/*"},
+            stream=True,
+            allow_redirects=False,
+        )
+        if response.status_code not in {301, 302, 303, 307, 308}:
+            break
+
+        location = response.headers.get("Location")
+        response.close()
+        if not location:
+            raise ValueError(f"Redirect response has no Location header: {current_url}")
+        if redirect_count >= MAX_REDIRECTS:
+            raise ValueError(f"Too many redirects while fetching URL: {url}")
+
+        next_url = urljoin(current_url, location)
+        next_parsed = urlparse(next_url)
+        if next_parsed.scheme.lower() not in {"http", "https"}:
+            raise ValueError(f"Only http/https redirects are supported: {next_url}")
+        # Validate before issuing the next request. This is the security boundary
+        # that automatic requests redirects bypassed.
+        _assert_public_host(next_parsed.hostname or "")
+        current_url = next_url
+
+    if response is None:  # pragma: no cover - loop always executes at least once
+        raise ValueError(f"Unable to fetch URL: {url}")
     response.raise_for_status()
 
-    # Re-validate the final host after any redirects.
-    final_host = urlparse(response.url).hostname or ""
+    effective_url = response.url or current_url
+    final_host = urlparse(effective_url).hostname or ""
     _assert_public_host(final_host)
 
     content_type = (response.headers.get("Content-Type") or "").lower()
@@ -159,7 +184,7 @@ def fetch_url(url: str) -> Dict[str, str]:
     raw = b"".join(chunks)[:MAX_BYTES]
 
     title = ""
-    if "application/pdf" in content_type or url.lower().endswith(".pdf"):
+    if "application/pdf" in content_type or effective_url.lower().endswith(".pdf"):
         text = _extract_pdf_bytes(raw)
     elif "html" in content_type or raw[:512].lstrip().lower().startswith((b"<!doctype html", b"<html")):
         extractor = _HTMLTextExtractor()
@@ -173,11 +198,11 @@ def fetch_url(url: str) -> Dict[str, str]:
         text = raw.decode("utf-8", errors="replace").strip()
 
     if not text or len(text.strip()) < 20:
-        raise ValueError(f"No readable text extracted from URL: {url}")
+        raise ValueError(f"No readable text extracted from URL: {effective_url}")
 
     if not title:
-        title = _domain_name(response.url)
-    return {"url": response.url, "title": title[:200], "text": text}
+        title = _domain_name(effective_url)
+    return {"url": effective_url, "title": title[:200], "text": text}
 
 
 def _extract_pdf_bytes(data: bytes) -> str:

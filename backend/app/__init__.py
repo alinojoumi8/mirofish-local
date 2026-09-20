@@ -5,6 +5,7 @@ MiroFish Backend - Flask Application Factory
 import os
 import warnings
 import time
+import uuid
 
 # Suppress multiprocessing resource_tracker warnings (from third-party libraries like transformers)
 # Must be set before all other imports
@@ -14,6 +15,8 @@ from flask import Flask, g, request
 from flask_cors import CORS
 
 from .config import Config
+from .services.control_plane import initialize_control_plane, initialize_simulation_runtime
+from .utils.error_handling import sanitize_error_response
 from .utils.logger import setup_logger, get_logger
 
 
@@ -41,7 +44,9 @@ def create_app(config_class=Config):
         logger.info("=" * 50)
 
     # Enable CORS
-    CORS(app, resources={r"/api/*": {"origins": "*"}})
+    CORS(app, resources={r"/api/*": {"origins": app.config.get('CORS_ORIGINS', [])}})
+
+    initialize_control_plane(app, logger, log_startup=should_log_startup)
 
     # --- Initialize Neo4jStorage singleton (DI via app.extensions) ---
     from .storage import Neo4jStorage
@@ -66,9 +71,8 @@ def create_app(config_class=Config):
         # Store None so endpoints can return 503 gracefully
         app.extensions['neo4j_storage'] = None
 
-    # Register simulation process cleanup function (ensure all simulation processes terminate on server shutdown)
-    from .services.simulation_runner import SimulationRunner
-    SimulationRunner.register_cleanup()
+    # Register process cleanup and reconcile persisted runner state.
+    initialize_simulation_runtime(app, logger, log_startup=should_log_startup)
     if should_log_startup:
         logger.info("Simulation process cleanup function registered")
 
@@ -76,6 +80,7 @@ def create_app(config_class=Config):
     @app.before_request
     def log_request():
         g.request_started_at = time.perf_counter()
+        g.request_id = request.headers.get('X-Request-ID') or str(uuid.uuid4())
         logger = get_logger('mirofish.request')
         logger.debug("Request started: %s %s", request.method, request.path)
         if request.content_type and 'json' in request.content_type:
@@ -92,6 +97,11 @@ def create_app(config_class=Config):
 
     @app.after_request
     def log_response(response):
+        request_id = getattr(g, 'request_id', str(uuid.uuid4()))
+        response.headers['X-Request-ID'] = request_id
+
+        response = sanitize_error_response(app, response, request_id)
+
         logger = get_logger('mirofish.request')
         started_at = getattr(g, "request_started_at", None)
         duration_ms = (time.perf_counter() - started_at) * 1000 if started_at else 0

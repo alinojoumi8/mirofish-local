@@ -2,6 +2,8 @@ import logging
 
 import pytest
 
+from flask import jsonify
+
 from app import create_app
 from app.models.case import CaseManager
 from app.models.task import TaskManager, TaskStatus
@@ -49,6 +51,8 @@ class LoggingTestConfig:
     TESTING = True
     DEBUG = False
     JSON_AS_ASCII = False
+    EXPOSE_INTERNAL_ERRORS = False
+    CORS_ORIGINS = ["http://127.0.0.1:3000", "http://localhost:3000"]
 
 
 @pytest.fixture
@@ -64,6 +68,18 @@ def app_client(monkeypatch):
     @app.route("/boom")
     def boom():
         raise RuntimeError("exploded")
+
+    @app.route("/leaky-error")
+    def leaky_error():
+        return jsonify({
+            "success": False,
+            "error": "database exploded",
+            "traceback": "secret stack and filesystem path",
+        }), 500
+
+    @app.route("/api/test-health")
+    def api_test_health():
+        return jsonify({"success": True})
 
     return app.test_client()
 
@@ -114,6 +130,41 @@ def test_request_logging_errors_for_unhandled_exceptions(app_client, capture_nam
         and "duration_ms=" in record.getMessage()
         for record in records
     )
+
+
+def test_internal_traceback_is_removed_from_json_error_response(app_client):
+    response = app_client.get("/leaky-error")
+
+    assert response.status_code == 500
+    payload = response.get_json()
+    assert payload["success"] is False
+    assert payload["error"] == "database exploded"
+    assert payload["error_code"] == "internal_error"
+    assert payload["request_id"]
+    assert "traceback" not in payload
+
+
+def test_cors_rejects_unconfigured_origins(app_client):
+    response = app_client.get("/api/test-health", headers={"Origin": "https://attacker.example"})
+
+    assert "Access-Control-Allow-Origin" not in response.headers
+
+
+def test_cors_allows_configured_local_origin(app_client):
+    response = app_client.get("/api/test-health", headers={"Origin": "http://127.0.0.1:3000"})
+
+    assert response.headers["Access-Control-Allow-Origin"] == "http://127.0.0.1:3000"
+
+
+def test_status_includes_control_plane_in_overall_readiness(app_client):
+    response = app_client.get("/api/status")
+
+    assert response.status_code == 200
+    data = response.get_json()["data"]
+    assert data["neo4j"]["healthy"] is True
+    assert data["embedding"]["healthy"] is True
+    assert data["control_db"]["healthy"] is False
+    assert data["healthy"] is False
 
 
 def test_task_manager_logs_lifecycle_transitions(capture_named_logger):

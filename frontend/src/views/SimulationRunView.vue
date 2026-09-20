@@ -70,6 +70,7 @@
 
 <script setup>
 import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
+import { createPoller } from '../utils/poller'
 import { useRoute, useRouter } from 'vue-router'
 import GraphPanel from '../components/GraphPanel.vue'
 import Step3Simulation from '../components/Step3Simulation.vue'
@@ -280,19 +281,17 @@ const refreshGraph = () => {
 }
 
 // --- Auto Refresh Logic ---
-let graphRefreshTimer = null
+const graphRefreshPoller = createPoller(refreshGraph, 30000)
 
 const startGraphRefresh = () => {
-  if (graphRefreshTimer) return
+  if (graphRefreshPoller.isRunning()) return
   addLog('Graph auto-refresh started (30s)')
-  // Refresh immediately, then every 30 seconds
-  graphRefreshTimer = setInterval(refreshGraph, 30000)
+  graphRefreshPoller.start()
 }
 
 const stopGraphRefresh = () => {
-  if (graphRefreshTimer) {
-    clearInterval(graphRefreshTimer)
-    graphRefreshTimer = null
+  if (graphRefreshPoller.isRunning()) {
+    graphRefreshPoller.stop()
     addLog('Graph auto-refresh stopped')
   }
 }
@@ -455,4 +454,3 @@ onUnmounted(() => {
   border-right: 1px solid #EAEAEA;
 }
 </style>
-

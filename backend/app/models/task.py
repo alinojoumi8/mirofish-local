@@ -55,6 +55,22 @@ class Task:
             "metadata": self.metadata,
         }
 
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'Task':
+        return cls(
+            task_id=data['task_id'],
+            task_type=data['task_type'],
+            status=TaskStatus(data.get('status', TaskStatus.PENDING.value)),
+            created_at=datetime.fromisoformat(data['created_at']),
+            updated_at=datetime.fromisoformat(data['updated_at']),
+            progress=int(data.get('progress', 0)),
+            message=data.get('message', ''),
+            result=data.get('result'),
+            error=data.get('error'),
+            metadata=data.get('metadata') or {},
+            progress_detail=data.get('progress_detail') or {},
+        )
+
 
 class TaskManager:
     """
@@ -64,6 +80,11 @@ class TaskManager:
 
     _instance = None
     _lock = threading.Lock()
+    _repository = None
+
+    @classmethod
+    def configure_repository(cls, repository) -> None:
+        cls._repository = repository
 
     def __new__(cls):
         """Singleton pattern"""
@@ -100,6 +121,8 @@ class TaskManager:
 
         with self._task_lock:
             self._tasks[task_id] = task
+        if self._repository is not None:
+            self._repository.put_task(task.to_dict())
 
         metadata_keys = ",".join(sorted((metadata or {}).keys())) or "-"
         logger.info(
@@ -114,7 +137,14 @@ class TaskManager:
     def get_task(self, task_id: str) -> Optional[Task]:
         """Get task"""
         with self._task_lock:
-            return self._tasks.get(task_id)
+            task = self._tasks.get(task_id)
+        if task is None and self._repository is not None:
+            payload = self._repository.get_task(task_id)
+            if payload:
+                task = Task.from_dict(payload)
+                with self._task_lock:
+                    self._tasks[task_id] = task
+        return task
 
     def update_task(
         self,
@@ -174,6 +204,10 @@ class TaskManager:
                     task.progress,
                     task.message or "-",
                 )
+            payload = task.to_dict()
+
+        if self._repository is not None:
+            self._repository.put_task(payload)
 
     def complete_task(self, task_id: str, result: Dict):
         """Mark task as completed"""
@@ -199,6 +233,12 @@ class TaskManager:
 
     def list_tasks(self, task_type: Optional[str] = None) -> list:
         """List tasks"""
+        if self._repository is not None:
+            for payload in self._repository.list_tasks():
+                task = Task.from_dict(payload)
+                with self._task_lock:
+                    self._tasks[task.task_id] = task
+
         with self._task_lock:
             tasks = list(self._tasks.values())
             if task_type:
@@ -217,3 +257,5 @@ class TaskManager:
             ]
             for tid in old_ids:
                 del self._tasks[tid]
+                if self._repository is not None:
+                    self._repository.delete_task(tid)

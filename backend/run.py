@@ -22,6 +22,11 @@ from app import create_app
 from app.config import Config
 
 
+def get_bind_host() -> str:
+    """Return the configured bind host, defaulting to loopback for local safety."""
+    return os.environ.get('FLASK_HOST', '127.0.0.1')
+
+
 def main():
     """Main function"""
     # Validate configuration
@@ -37,7 +42,7 @@ def main():
     app = create_app()
 
     # Get runtime configuration
-    host = os.environ.get('FLASK_HOST', '0.0.0.0')
+    host = get_bind_host()
     port = int(os.environ.get('FLASK_PORT', 5001))
     debug = Config.DEBUG
 
@@ -47,4 +52,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-

@@ -10,6 +10,7 @@ Local graph storage replacing Zep Cloud:
 
 from .graph_storage import GraphStorage
 from .neo4j_storage import Neo4jStorage
+from .control_db import ControlDatabase
 from .embedding_service import EmbeddingService, EmbeddingError
 from .ner_extractor import NERExtractor
 from .search_service import SearchService
@@ -17,6 +18,7 @@ from .search_service import SearchService
 __all__ = [
     "GraphStorage",
     "Neo4jStorage",
+    "ControlDatabase",
     "EmbeddingService",
     "EmbeddingError",
     "NERExtractor",
